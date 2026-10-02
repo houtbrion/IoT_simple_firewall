@@ -1,0 +1,607 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from bcc import BPF
+from bcc.utils import printb
+from socket import inet_ntop, AF_INET, AF_INET6
+from struct import pack
+import sys
+import time
+import ctypes
+
+
+bpf_text = """
+//#include <uapi/linux/bpf.h>
+//#include <bpf/bpf.h>
+#include <linux/bpf.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/in.h>
+#include <linux/if_ether.h>
+//#include <bpf/bpf_endian.h>
+//#include <bpf/bpf_helpers.h>
+
+
+#define MAX_TCP_HEADER_BYTES 60
+
+#define MAC_BROADCAST    0xFFFFFFFFFFFF
+#define MAC_MULTICAST_MASK 0x800000000000
+
+#define ENABLE 1
+#define DISABLE 0
+
+//BPF_HASH(srcMAC, u64, u32);
+//BPF_HASH(denyMAC, u64, u32);
+BPF_HASH(serverMAC, u64, u32);
+BPF_HASH(allowMAC, u64, u32);
+
+struct packet_event_t {
+  u64 eth_source, eth_dest;
+  u32 protocol;
+  u32 v4_source, v4_dest;
+  u16 port_source, port_dest;
+};
+
+BPF_PERF_OUTPUT(packet_events);
+
+int packet_filter(struct xdp_md *ctx) {
+  void* data_end = (void*)(long)ctx->data_end;
+  void* data = (void*)(long)ctx->data;
+  struct ethhdr *eth = data;
+  u64 zero64=0;
+  u32 zero32=0;
+  u16 zero16=0;
+  u64 nh_off = sizeof(*eth);
+  u64 eth_source, eth_dest;
+  struct packet_event_t event;
+  event.eth_source = zero64;
+  event.eth_dest = zero64;
+  event.protocol = zero32;
+  event.v4_source = zero32;
+  event.v4_dest = zero32;
+  event.port_source = zero16;
+  event.port_dest = zero16;
+
+  if (data + nh_off > data_end)
+    return XDP_PASS;
+
+  for (int i=0; i< ETH_ALEN ; i++) {
+    eth_source = eth_source << 8;
+    eth_dest = eth_dest << 8;
+    eth_source = eth_source | (eth->h_source[i]);
+    eth_dest = eth_dest | (eth->h_dest[i]);
+  }
+  event.eth_source = eth_source;
+  event.eth_dest = eth_dest;
+  eth_source = 0;
+  eth_dest = 0;
+
+  // MACアドレスの分類
+  //packet_events.perf_submit(ctx, &event, sizeof(event));
+  if (event.eth_dest == MAC_BROADCAST) { // ブロードキャストの場合
+    // MACのソースが認められた端末なら通す
+    u8 check_mac =0;
+    eth_source = event.eth_source;
+    u32 *val;
+    val = serverMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        check_mac = 1;
+      }
+    }
+    if (check_mac ==0) { // MACチェックの結果が否の場合
+      // MACのソースアドレスが認められたものか否かを確認
+      val = allowMAC.lookup_or_init(&eth_source, &zero32);
+      if (val) {
+        if ((*val) == ENABLE) {
+          check_mac = 1;
+        }
+      }
+    }
+    if (check_mac ==0) { // MACチェックの結果が否の場合
+      // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
+      if (eth->h_proto == htons(ETH_P_IP)) {
+        struct iphdr *iph = data + nh_off;
+        if ((void*)&iph[1] > data_end)
+          return XDP_PASS;
+
+        event.protocol = iph->protocol;
+        event.v4_source = iph->saddr;
+        event.v4_dest = iph->daddr;
+      }
+      packet_events.perf_submit(ctx, &event, sizeof(event));
+      return XDP_DROP;
+    }
+  } else if ((event.eth_source & MAC_MULTICAST_MASK) > 0) { // マルチキャストの場合
+    // MACのソースが認められた端末なら通す
+    //packet_events.perf_submit(ctx, &event, sizeof(event));
+    u8 check_mac =0;
+    eth_source = event.eth_source;
+    u32 *val;
+    val = serverMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        check_mac = 1;
+      }
+    }
+    if (check_mac ==0) { // MACチェックの結果が否の場合
+      val = allowMAC.lookup_or_init(&eth_source, &zero32);
+      if (val) {
+        if ((*val) == ENABLE) {
+          check_mac = 1;
+        }
+      }
+    }
+    if (check_mac ==0) { // MACチェックの結果が否の場合
+      // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
+      if (eth->h_proto == htons(ETH_P_IP)) {
+        struct iphdr *iph = data + nh_off;
+        if ((void*)&iph[1] > data_end)
+          return XDP_PASS;
+
+        event.protocol = iph->protocol;
+        event.v4_source = iph->saddr;
+        event.v4_dest = iph->daddr;
+      }
+      packet_events.perf_submit(ctx, &event, sizeof(event));
+      return XDP_DROP;
+    }
+  } else { // ユニキャストの場合
+    //packet_events.perf_submit(ctx, &event, sizeof(event));
+    u8 check_mac =0;
+    eth_source = event.eth_source;
+    u32 *val;
+    val = serverMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        check_mac = 1;
+      }
+    }
+    if (check_mac ==0) { // MACチェックの結果が否の場合
+      val = allowMAC.lookup_or_init(&eth_source, &zero32);
+      if (val) {
+        if ((*val) == ENABLE) {
+          eth_dest = event.eth_dest;
+          val = serverMAC.lookup_or_init(&eth_dest, &zero32);
+          if (val) {
+            if ((*val) == ENABLE) {
+              check_mac = 1;
+            }
+          }
+        }
+      }
+    }
+    if (check_mac ==0) { // MACチェックの結果が否の場合
+      // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
+      if (eth->h_proto == htons(ETH_P_IP)) {
+        struct iphdr *iph = data + nh_off;
+        if ((void*)&iph[1] > data_end)
+          return XDP_PASS;
+
+        event.protocol = iph->protocol;
+        event.v4_source = iph->saddr;
+        event.v4_dest = iph->daddr;
+      }
+      packet_events.perf_submit(ctx, &event, sizeof(event));
+      return XDP_DROP;
+    }
+  }
+
+  if (eth->h_proto == htons(ETH_P_IP)) {
+    struct iphdr *iph = data + nh_off;
+    if ((void*)&iph[1] > data_end)
+      return XDP_PASS;
+
+    event.protocol = iph->protocol;
+    event.v4_source = iph->saddr;
+    event.v4_dest = iph->daddr;
+
+    int ip_hdr_len = iph->ihl *4;
+    if (ip_hdr_len < sizeof(struct iphdr)) {
+      return XDP_PASS;
+    }
+
+    if (event.protocol == IPPROTO_TCP) {
+      struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
+      if ((void *)(tcp +1) > data_end) {
+        return XDP_PASS;
+      }
+      u32 tcp_header_len = tcp->doff *4;
+      if (tcp_header_len < sizeof (*tcp) || tcp_header_len > MAX_TCP_HEADER_BYTES) {
+        return XDP_PASS;
+      }
+      event.port_source = ntohs(tcp->source);
+      event.port_dest = ntohs(tcp->dest);
+    }
+    
+    if (event.protocol == IPPROTO_UDP) {
+      struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
+      if ((void *)(udp +1) > data_end) {
+        return XDP_PASS;
+      }
+      if (udp->len < sizeof (*udp) ) {
+        return XDP_PASS;
+      }
+      event.port_source = ntohs(udp->source);
+      event.port_dest = ntohs(udp->dest);
+    }
+
+    if (event.protocol == IPPROTO_ICMP) {
+      eth_source = event.eth_source;
+      u32 *val;
+      //packet_events.perf_submit(ctx, &event, sizeof(event));
+      val = serverMAC.lookup_or_init(&eth_source, &zero32);
+      if (val) {
+        if ((*val) == ENABLE) {
+          return XDP_PASS;
+        }
+      }
+      val = denyMAC.lookup_or_init(&eth_source, &zero32);
+      if (val) {
+        if ((*val) == ENABLE) {
+          return XDP_DROP;
+        }
+      }
+      val = allowMAC.lookup_or_init(&eth_source, &zero32);
+      if (val) {
+        if ((*val) == ENABLE) {
+          eth_dest = event.eth_dest;
+          val = serverMAC.lookup_or_init(&eth_dest, &zero32);
+          if (val) {
+            if ((*val) == ENABLE) {
+              return XDP_PASS;
+            }
+          }
+        }
+      }
+      return XDP_DROP;
+    }
+  }
+  return XDP_PASS;
+}
+"""
+
+def print_packet_event(cpu,data,size):
+  global b, enable, disable, eth_allow_table, eth_disable_table
+  #eth_disable_table[ctypes.c_uint64(2)] = ctypes.c_uint32(4)
+  event = b["packet_events"].event(data)
+  printb(b"%-2d %-12lx %-16s %-5d %-12lx %-16s %-5d" % (event.protocol,
+    event.eth_source,
+    inet_ntop(AF_INET, pack("I",event.v4_source)).encode(),
+    event.port_source,
+    event.eth_dest,
+    inet_ntop(AF_INET, pack("I",event.v4_dest)).encode(),
+    event.port_dest))
+
+#denyMacList = [0x12345678, 0xcc96e5b8d450]
+#denyMacList = []
+serverMacList = [0x80027157b59]
+allowMacList = [0xcc96e5b8d450]
+
+allowProtocolList = [
+0,   # IPPROTO_IP
+1,   # IPPROTO_ICMP
+2,   # IPPROTO_IGMP
+4,   # IPPROTO_IPIP
+6,   # IPPROTO_TCP
+8,   # IPPROTO_EGP
+12,  # IPPROTO_PUP
+17,  # IPPROTO_UDP
+22,  # IPPROTO_IDP
+29,  # IPPROTO_TP
+33,  # IPPROTO_DCCP
+41,  # IPPROTO_IPV6
+46,  # IPPROTO_RSVP
+47,  # IPPROTO_GRE
+50,  # IPPROTO_ESP
+51,  # IPPROTO_AH
+92,  # IPPROTO_MTP
+94,  # IPPROTO_BEETPH
+98,  # IPPROTO_ENCAP
+103, # IPPROTO_PIM
+108, # IPPROTO_COMP
+115, # IPPROTO_L2TP
+132, # IPPROTO_SCTP
+136, # IPPROTO_UDPLITE
+137, # IPPROTO_MPLS
+143, # IPPROTO_ETHERNET
+144, # IPPROTO_AGGFRAG
+255, # IPPROTO_RAW
+256, # IPPROTO_SMC
+262, # IPPROTO_MPTCP
+]
+
+allowPortList = [
+1,    # TCP, UDP : TCP Port Service Multiplexer
+2,    # TCP, UDP : CompressNET Management Utility
+3,    # TCP, UDP : CompressNET Compression Process
+5,    # TCP, UDP : Remote Job Entry
+7,    # TCP, UDP : Echo Protocol
+9,    # TCP, UDP : Discard Protocol or Wake-on-LAN
+11,   # TCP, UDP : Active Users (systat service)
+13,   # TCP, UDP : Daytime Protocol (RFC 867)
+15,   # TCP, UDP : Previously netstat service
+17,   # TCP, UDP : Quote of the Day
+18,   # TCP, UDP : Message send protocol
+19,   # TCP, UDP : Character Generator Protocol (RFC 864)
+20,   # TCP, UDP : FTP data port
+21,   # TCP, UDP : FTP control port
+22,   # TCP, UDP : SSH
+23,   # TCP, UDP : telnet
+24,   # TCP, UDP : Priv-mail
+25,   # TCP, UDP : Simple Mail Transfer Protocol (SMTP)
+27,   # TCP, UDP : NSW User System FE
+29,   # TCP, UDP : MSG ICP
+33,   # TCP, UDP : Display Support Protocol
+35,   # TCP, UDP : Printer server
+37,   # TCP, UDP : Time Protocol
+39,   # TCP, UDP : Resource Location Protocol
+42,   # TCP, UDP : ARPA Host Name Server Protocol / Windows Internet Name Service
+43,   # TCP, UDP : WHOIS protocol
+47,   # TCP, UDP : NI FTP
+49,   # TCP, UDP : TACACS+ Login Host protocol
+51,   # TCP, UDP : IMP Logical Address Maintenance
+52,   # TCP, UDP : XNS (Xerox Network Systems) Time Protocol
+53,   # TCP, UDP : Domain Name System (DNS)
+54,   # TCP, UDP : Xerox Network Systems (XNS) clearinghouse
+55,   # TCP, UDP : ISI Graphics Language (ISI-GL)
+56,   # TCP, UDP : Xerox Network Systems (XNS) authentication / Route Access Protocol (RAP)
+58,   # TCP, UDP : Xerox Network Systems (XNS) Mail
+64,   # TCP, UDP : CI (Travelport) (formerly Covia) Comms Integrator
+67,   # TCP, UDP : Bootstrap Protocol (BOOTP) サーバ
+68,   # TCP, UDP : Bootstrap Protocol (BOOTP) クライアント
+69,   # TCP, UDP : Trivial File Transfer Protocol (TFTP)
+70,   # TCP, UDP : 	Gopherプロトコル
+71,   # TCP, UDP : NETRJSプロトコル
+74,   # TCP, UDP : NETRJSプロトコル
+77,   # TCP, UDP : 任意のプライベートリモートジョブエントリ（Any private remote job entry）
+79,   # TCP, UDP : Fingerプロトコル
+80,   # TCP, UDP : Hypertext Transfer Protocol (HTTP)
+88,   # TCP, UDP : Kerberos
+90,   # TCP, UDP : dnsix (DoD Network Security for Information Exchange) Security Attribute Token Map / PointCast
+99,   # TCP,     : WIP Messageプロトコル
+100,  #    , UDP : CyberGate RATプロトコル
+101,  # TCP, UDP : NICホスト名
+102,  # TCP, UDP : ISO Transport Service Access Point (TSAP) Class 0 protocol; also used by Digital Equipment Corporation DECnet (Phase V+) over TCP/IP
+104,  # TCP, UDP : ACR/NEMA DICOM
+105,  # TCP, UDP : CCSO Nameserver Protocol (Qi/Ph)
+107,  # TCP, UDP : Remote TELNET Service protocol
+108,  # TCP, UDP : SNA Gateway Access Server
+109,  # TCP, UDP : Post Office Protocol v2 (POP2)
+110,  # TCP, UDP : Post Office Protocol v3 (POP3)
+111,  # TCP, UDP : ONC RPC (Sun RPC)
+113,  # TCP,     : Ident, authentication service/identification protocol, used by IRC servers to identify users
+      #    , UDP : Authentication Service (auth)
+115,  # TCP,     : Simple File Transfer Protocol
+117,  # TCP, UDP : UUCP Path Service
+118,  # TCP, UDP : Structured Query Language (SQL) Services
+119,  # TCP,     : Network News Transfer Protocol (NNTP), retrieval of newsgroup messages
+123,  # TCP, UDP : Network Time Protocol (NTP)
+126,  # TCP, UDP : Formerly Unisys Unitary Login, renamed by Unisys to NXEdit. Used by Unisys Programmer's Workbench for Clearpath MCP, an IDE for Unisys MCP software development
+135,  # TCP, UDP : DCE endpoint resolution
+137,  # TCP, UDP : NetBIOS Name Service
+138,  # TCP, UDP : NetBIOS Datagram Service
+139,  # TCP, UDP : NetBIOS Session Service
+143,  # TCP,     : Internet Message Access Protocol (IMAP), management of email messages
+152,  # TCP, UDP : Background File Transfer Program (BFTP)
+153,  # TCP, UDP : Simple Gateway Monitoring Protocol (SGMP)
+156,  # TCP, UDP : SQL Service
+158,  # TCP, UDP : Distributed Mail Service Protocol (DMSP)
+161,  #    , UDP : Simple Network Management Protocol (SNMP)
+162,  # TCP, UDP : Simple Network Management Protocol Trap (SNMPTRAP)
+170,  # TCP,     : Print-srv, Network PostScript
+175,  # TCP,     : VMNET (IBM z/VM, z/OS & z/VSE Network Job Entry (NJE))
+177,  # TCP, UDP : X Display Manager Control Protocol (XDMCP)
+179,  # TCP,     : Border Gateway Protocol (BGP)
+194,  # TCP, UDP : Internet Relay Chat (IRC)
+199,  # TCP, UDP : SMUX, SNMP Unix Multiplexer
+201,  # TCP, UDP : AppleTalk Routing Maintenance
+209,  # TCP, UDP : Quick Mail Transfer Protocol
+210,  # TCP, UDP : ANSI Z39.50
+213,  # TCP, UDP : Internetwork Packet Exchange (IPX)
+218,  # TCP, UDP : Message posting protocol (MPP)
+220,  # TCP, UDP : Internet Message Access Protocol (IMAP), version 3
+259,  # TCP, UDP : Efficient Short Remote Operations (ESRO)
+262,  # TCP, UDP : Arcisdms
+264,  # TCP, UDP : Border Gateway Multicast Protocol (BGMP)
+280,  # TCP, UDP : http-mgmt
+300,  # TCP,     : ThinLinc Web Access
+308,  # TCP,     : Novastor Online Backup
+311,  # TCP,     : macOS Server Admin (AppleShare IP Web administration)
+318,  # TCP, UDP : PKIX Time Stamp Protocol (TSP)
+319,  #    , UDP : Precision Time Protocol (PTP) event messages
+320,  #    , UDP : Precision Time Protocol (PTP) general messages
+350,  # TCP, UDP : Mapping of Airline Traffic over Internet Protocol (MATIP) type A
+351,  # TCP, UDP : MATIP type B
+356,  # TCP, UDP : cloanto-net-1 (used by Cloanto Amiga Explorer and VMs)
+366,  # TCP, UDP : On-Demand Mail Relay (ODMR)
+369,  # TCP, UDP : RPC 2 Port Mapper
+370,  # TCP, UDP : Coda authentication server
+371,  # TCP, UDP : ClearCase albd
+383,  # TCP, UDP : HP data alarm manager
+384,  # TCP, UDP : A Remote Network Server System
+387,  # TCP, UDP : AURP, AppleTalk Update-based Routing Protocol
+389,  # TCP, UDP : Lightweight Directory Access Protocol (LDAP)
+399,  # TCP, UDP : Digital Equipment Corporation DECnet (Phase V+) over TCP/IP
+401,  # TCP, UDP : Uninterruptible power supply (UPS)
+427,  # TCP, UDP : Service Location Protocol (SLP)
+433,  # TCP, UDP : NNSP, part of Network News Transfer Protocol
+434,  # TCP, UDP : Mobile IP Agent (RFC 5944)
+443,  # TCP, UDP : Hypertext Transfer Protocol over TLS/SSL (HTTPS)
+444,  # TCP, UDP : Simple Network Paging Protocol (SNPP), RFC 1568
+445,  # TCP,     : Microsoft-DS Active Directory, Windows shares
+      # TCP,     : Microsoft-DS SMB file sharing
+464,  # TCP, UDP : Kerberos Change/Set password
+465,  # TCP,     : URL Rendezvous Directory for SSM (Cisco protocol) / Message Submission over TLS protocol (SMTPS, RFC 8314)
+475,  # TCP, UDP : tcpnethaspsrv, Aladdin Knowledge Systems Hasp services
+491,  # TCP, UDP : GO-Global remote access and application publishing software (go-login)
+497,  # TCP,     : Dantz Retrospect
+500,  # TCP, UDP : Internet Security Association and Key Management Protocol (ISAKMP)
+502,  # TCP, UDP : Modbus Protocol
+504,  # TCP, UDP : Citadel, multiservice protocol for dedicated clients for the Citadel groupware system
+510,  # TCP, UDP : FirstClass Protocol (FCP), used by FirstClass client/server groupware system
+512,  # TCP,     : Rexec, Remote Process Execution
+      #    , UDP : comsat, together with biff
+513,  # TCP,     : rlogin
+      #    , UDP : who
+514,  # TCP,     : Remote Shell, used to execute non-interactive commands on a remote system (Remote Shell, rsh, remsh)
+      #    , UDP : Syslog, used for system logging
+515,  # TCP,     : Line Printer Daemon (LPD), print service
+517,  #    , UDP : Talk
+518,  #    , UDP : NTalk
+520,  # TCP,     : efs, extended file name server
+      #    , UDP : Routing Information Protocol (RIP)
+521,  #    , UDP : Routing Information Protocol Next Generation (RIPng)
+524,  # TCP, UDP : 	NetWare Core Protocol (NCP) is used for a variety things such as access to primary NetWare server resources, Time Synchronization, etc.
+525,  #    , UDP : Timed, Timeserver
+530,  # TCP, UDP : Remote procedure call (RPC)
+531,  # TCP, UDP : AOL Instant Messenger
+532,  # TCP,     : netnews
+533,  #    , UDP : netwall, For Emergency Broadcasts
+540,  # TCP,     : Unix-to-Unix Copy Protocol (UUCP)
+542,  # TCP, UDP : commerce (Commerce Applications)
+543,  # TCP,     : klogin, Kerberos login
+544,  # TCP,     : kshell, Kerberos Remote shell
+545,  # TCP,     : OSIsoft PI (VMS), OSISoft PI Server Client Access
+546,  # TCP, UDP : DHCPv6 client
+547,  # TCP, UDP : DHCPv6 server
+548,  # TCP,     : Apple Filing Protocol (AFP) over TCP
+550,  # TCP, UDP : new-rwho, new-who
+554,  # TCP, UDP : Real Time Streaming Protocol (RTSP)
+556,  # TCP,     : Remotefs, RFS, rfs_server
+560,  #    , UDP : rmonitor, Remote Monitor
+561,  #    , UDP : monitor
+563,  # TCP, UDP : NNTP over TLS/SSL (NNTPS)
+564,  # TCP,     : 9P (Plan9)
+587,  # TCP,     : e-mail message submission (SMTP)
+591,  # TCP,     : FileMaker 6.0 (and later) Web Sharing
+593,  # TCP, UDP : HTTP RPC Ep Map, Remote procedure call over Hypertext Transfer Protocol, often used by Distributed Component Object Model services and Microsoft Exchange Server
+601,  # TCP,     : Reliable Syslog Service used for system logging
+604,  # TCP,     : TUNNEL profile, a protocol for BEEP peers to form an application layer tunnel
+623,  #    , UDP : ASF Remote Management and Control Protocol (ASF-RMCP)
+625,  # TCP,     : Open Directory Proxy (ODProxy)
+631,  # TCP, UDP : Internet Printing Protocol (IPP) / CUPS administration console (extension to IPP)
+635,  # TCP, UDP : RLZ DBase
+636,  # TCP, UDP : Lightweight Directory Access Protocol over TLS/SSL (LDAPS)
+639,  # TCP, UDP : MSDP, Multicast Source Discovery Protocol
+641,  # TCP, UDP : SupportSoft Nexus Remote Command (control/listening), a proxy gateway connecting remote control traffic
+643,  # TCP, UDP : SANity
+646,  # TCP, UDP : Label Distribution Protocol (LDP), a routing protocol used in MPLS networks
+647,  # TCP,     : DHCP Failover protocol
+648,  # TCP,     : Registry Registrar Protocol (RRP)
+651,  # TCP, UDP : IEEE-MMS
+653,  # TCP, UDP : SupportSoft Nexus Remote Command (data), a proxy gateway connecting remote control traffic
+654,  # TCP,     : Media Management System (MMS) Media Management Protocol (MMP)
+655,  # TCP, UDP : Tinc VPN daemon
+657,  # TCP, UDP : IBM RMC (Remote monitoring and Control) protocol, used by System p5 AIX Integrated Virtualization Manager (IVM)[29] and Hardware Management Console to connect managed logical partitions (LPAR) to enable dynamic partition reconfiguration
+660,  # TCP,     : macOS Server administration
+666,  # TCP, UDP : Doom(game)
+      # TCP,     : airserv-ng, aircrack-ng's server for remote-controlling wireless devices
+674,  # TCP,     : Application Configuration Access Protocol (ACAP)
+688,  # TCP, UDP : REALM-RUSD (ApplianceWare Server Appliance Management Protocol)
+690,  # TCP, UDP : Velneo Application Transfer Protocol (VATP)
+691,  # TCP,     : MS Exchange Routing
+694,  # TCP, UDP : Linux-HA high-availability heartbeat
+695,  # TCP,     : IEEE Media Management System over SSL (IEEE-MMS-SSL)
+698,  #    , UDP : Optimized Link State Routing (OLSR)
+700,  # TCP,     : Extensible Provisioning Protocol (EPP), a protocol for communication between domain name registries and registrars (RFC 5734)
+701,  # TCP,     : Link Management Protocol (LMP), a protocol that runs between a pair of nodes and is used to manage traffic engineering (TE) links
+702,  # TCP,     : IRIS (Internet Registry Information Service) over BEEP (Blocks Extensible Exchange Protocol) (RFC 3983)
+706,  # TCP,     : Secure Internet Live Conferencing (SILC)
+711,  # TCP,     : Cisco Tag Distribution Protocol being replaced by the MPLS Label Distribution Protocol
+712,  # TCP,     : Topology Broadcast based on Reverse-Path Forwarding routing protocol (TBRPF; RFC 3684)
+749,  # TCP, UDP : Kerberos administration
+750,  #    , UDP : kerberos-iv, Kerberos version IV
+751,  # TCP, UDP : kerberos_master, Kerberos authentication
+752,  #    , UDP : passwd_server, Kerberos password (kpasswd) server
+753,  # TCP,     : Reverse Routing Header (RRH)
+      #    , UDP : Reverse Routing Header (RRH) / userreg_server, Kerberos userreg server
+754,  # TCP,     : tell send / krb5_prop, Kerberos v5 slave propagation
+      #    , UDP : tell send
+760,  # TCP, UDP : krbupdate [kreg], Kerberos registration
+782,  # TCP,     : Conserver serial-console management server
+783,  # TCP,     : SpamAssassin spamd daemon
+800,  #    , UDP : mdbe daemon
+808,  # TCP,     : Microsoft Net.TCP Port Sharing Service
+829,  # TCP,     : Certificate Management Protocol
+843,  # TCP,     : Adobe Flash
+847,  # TCP,     : DHCP Failover protocol
+848,  # TCP, UDP : Group Domain Of Interpretation (GDOI) protocol
+853,  # TCP,     : DNS over TLS
+      #    , UDP : Group Domain Of Interpretation (GDOI) protocol
+860,  # TCP,     : iSCSI (RFC 3720)
+861,  # TCP, UDP : OWAMP control (RFC 4656)
+862,  # TCP, UDP : TWAMP control (RFC 5357)
+873,  # TCP,     : rsync file synchronization protocol
+888,  # TCP,     : cddbp, CD DataBase (CDDB) protocol (CDDBP) / IBM Endpoint Manager Remote Control
+897,  # TCP, UDP : Brocade SMI-S RPC
+898,  # TCP, UDP : Brocade SMI-S RPC SSL
+901,  # TCP,     : Samba Web Administration Tool (SWAT)
+      # TCP, UDP : VMware Virtual Infrastructure Client (from managed device to management console)
+902,  # TCP, UDP : ideafarm-door (IdeaFarm (tm) Operations) / VMware Server Console (from management console to managed device)
+903,  # TCP, UDP : ideafarm-panic (IdeaFarm (tm) Operations)
+      # TCP,     : VMware Remote Console
+904,  # TCP,     : VMware Server alternate
+911,  # TCP,     : Network Console on Acid (NCA), local tty redirection over OpenSSH
+944,  #    , UDP : Network File System Service (NFS)
+953,  # TCP, UDP : Domain Name System (DNS) RNDC Service
+973,  #    , UDP : Network File System over IPv6 Service
+981,  # TCP,     : SofaWare Technologies Remote HTTPS management for firewall devices running embedded Check Point FireWall-1 software
+987,  # TCP,     : Microsoft Windows SBS SharePoint
+989,  # TCP, UDP : FTPS Protocol (data), FTP over TLS/SSL
+990,  # TCP, UDP : FTPS Protocol (control), FTP over TLS/SSL
+991,  # TCP, UDP : Netnews Administration System (NAS)
+992,  # TCP, UDP : TELNET protocol over TLS/SSL
+993,  # TCP,     : Internet Message Access Protocol over TLS/SSL (IMAPS)
+994,  # TCP, UDP : Internet Relay Chat over TLS/SSL (IRCS)
+995,  # TCP,     : Post Office Protocol 3 over TLS/SSL (POP3S)
+999,  # TCP,     : ScimoreDB Database System
+1002, # TCP,     : Opsware agent (aka cogbot)
+1010, # TCP,     : ThinLinc Web Administration
+]
+
+
+b = BPF(text=bpf_text)
+fn = b.load_func("packet_filter", BPF.XDP)
+
+#device = sys.argv[1]
+device = "enp0s3"
+b.attach_xdp(device, fn)
+
+#eth_deny_table = b.get_table("denyMAC")
+eth_server_table = b.get_table("serverMAC")
+eth_allow_table = b.get_table("allowMAC")
+#eth_source_table[ctypes.c_uint64(2)] = ctypes.c_uint32(4)
+#eth_source_table[2].value = 4
+
+
+b["packet_events"].open_perf_buffer(print_packet_event)
+
+# ハッシュテーブルの定数値定義
+disable=0
+enable=1
+
+# MACアドレスをハッシュテーブルに登録
+# deny
+#for i in denyMacList:
+#  eth_deny_table[ctypes.c_uint64(i)] = ctypes.c_uint32(enable)
+# allow
+for i in allowMacList:
+  eth_allow_table[ctypes.c_uint64(i)] = ctypes.c_uint32(enable)
+# server
+for i in serverMacList:
+  eth_server_table[ctypes.c_uint64(i)] = ctypes.c_uint32(enable)
+
+while True:
+  try:
+    b.perf_buffer_poll()
+    #dropcnt.clear()
+    #time.sleep(1)
+    #for k, v in dropcnt.items():
+    #  print("{} {}: {} pkt/s".format(time.strftime("%H:%M:%S"), k.value, v.value))
+  except KeyboardInterrupt:
+    break
+
+b.remove_xdp(device)
+
