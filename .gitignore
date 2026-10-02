@@ -67,3 +67,22 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# pyinstaller
+*.exe
+
+# vim
+*~
+*.swp
+
+# backup and etc
+backup
+bak
+.ipynb_checkpoints
+.jupyter
+*.old
+tmp
+example
+config.h
+config.yaml
+test*
