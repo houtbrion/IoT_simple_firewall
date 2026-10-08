@@ -221,8 +221,11 @@ int packet_filter(struct xdp_md *ctx) {
       // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
       if (eth->h_proto == htons(ETH_P_IP)) {
         struct iphdr *iph = data + nh_off;
-        if ((void*)&iph[1] > data_end)
-          return XDP_PASS;
+        if ((void*)&iph[1] > data_end) {
+          //return XDP_PASS;
+          packet_events.perf_submit(ctx, &event, sizeof(event));
+          return XDP_DROP;
+        }
         event.protocol = iph->protocol;
         event.v4_source = iph->saddr;
         event.v4_dest = iph->daddr;
