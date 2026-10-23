@@ -1,0 +1,41 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from bcc import BPF
+import sys
+import time
+
+bpf_text = """
+#include <uapi/linux/bpf.h>
+#include <linux/ip.h>
+
+BPF_HASH(dropcnt, u32, u32);
+
+int xdp_packet_count(struct xdp_md *ctx) {
+
+  u32 value = 0, protocol=0, *vp;
+
+  vp = dropcnt.lookup_or_init(&protocol, &value);
+  *vp += 1;
+
+  return XDP_PASS;
+}
+"""
+
+b = BPF(text=bpf_text)
+
+#device = sys.argv[1]
+device = "enp0s3"
+
+b.attach_xdp(device, fn = b.load_func("xdp_packet_count", BPF.XDP))
+dropcnt = b.get_table("dropcnt")
+while True:
+  try:
+    dropcnt.clear()
+    time.sleep(1)
+    for k, v in dropcnt.items():
+      print("{} {}: {} pkt/s".format(time.strftime("%H:%M:%S"), k.value, v.value))
+  except KeyboardInterrupt:
+    break
+
+b.remove_xdp(device)

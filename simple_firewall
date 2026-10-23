@@ -31,26 +31,49 @@ bpf_text = """
 #define ENABLE 1
 #define DISABLE 0
 
+#define TEST_FLAG_ETH_PROTOCOL 0
+#define TEST_FLAG_IP_PROTOCOL  1
+#define TEST_FLAG_IP_PORT      2
 
 BPF_HASH(testFlags, u32, u32);
 
 BPF_HASH(serverMAC, u64, u32);
 BPF_HASH(allowMAC, u64, u32);
 
-BPF_HASH(allowProtocolList, u32, u32);
+BPF_HASH(allowEthProtocolList, u32, u32);
+BPF_HASH(allowIpProtocolList, u32, u32);
 
 BPF_HASH(allowPortListTCP, u32, u32);
 BPF_HASH(allowPortListUDP, u32, u32);
 
+BPF_HASH(allowArpOpCode, u32, u32);
+
+struct arphdr_eth_ipv4 {
+    __be16 ar_hrd;      // Hardware type (Ethernet = 1)
+    __be16 ar_pro;      // Protocol type (IPv4 = 0x0800)
+    __u8   ar_hln;      // Hardware address length (6 for MAC)
+    __u8   ar_pln;      // Protocol address length (4 for IPv4)
+    __be16 ar_op;        // ARP operation (1 = request, 2 = reply)
+    __u8   ar_sha[6];   // Sender hardware address (MAC)
+    __be32 ar_sip;      // Sender IP address
+    __u8   ar_tha[6];   // Target hardware address (MAC)
+    __be32 ar_tip;      // Target IP address
+} __attribute__((packed));
+
 struct packet_event_t {
+  u16 eth_proto;
   u64 eth_source, eth_dest;
-  u32 protocol;
+  u32 ip_protocol;
   u32 v4_source, v4_dest;
   u16 port_source, port_dest;
+  u16 arp_opcode;
+  u32 arp_source_ip, arp_target_ip;
+  u64 arp_source_mac, arp_target_mac;
 };
 
 struct packet_test_flags_t {
-  u32 protocl;
+  u32 eth_protocol;
+  u32 ip_protocol;
   u32 port;
 }
 
@@ -68,25 +91,40 @@ int packet_filter(struct xdp_md *ctx) {
   struct packet_event_t event;
   event.eth_source = zero64;
   event.eth_dest = zero64;
-  event.protocol = zero32;
+  event.eth_proto = zero16;
+  event.ip_protocol = zero32;
   event.v4_source = zero32;
   event.v4_dest = zero32;
   event.port_source = zero16;
   event.port_dest = zero16;
+  event.arp_opcode = zero16;
+  event.arp_source_ip = zero32;
+  event.arp_target_ip = zero32;
+  event.arp_source_mac = zero64;
+  event.arp_target_mac = zero64;
 
   struct packet_test_flags_t test_flags;
-  test_flags.protocl = zero32;
+  test_flags.ip_protocol = zero32;
   test_flags.port = zero32;
   u32 *test_flag_val;
-  u32 test_flag_key = 0;
+
+  u32 test_flag_key = TEST_FLAG_ETH_PROTOCOL;
   test_flag_val = testFlags.lookup_or_init(&test_flag_key, &zero32);
   if (test_flag_val) {
     if ((*test_flag_val) == ENABLE) {
-      test_flags.protocl = ENABLE;
+      test_flags.eth_protocol = ENABLE;
     }
   }
 
-  u32 test_flag_key = 1;
+  test_flag_key = TEST_FLAG_IP_PROTOCOL;
+  test_flag_val = testFlags.lookup_or_init(&test_flag_key, &zero32);
+  if (test_flag_val) {
+    if ((*test_flag_val) == ENABLE) {
+      test_flags.ip_protocol = ENABLE;
+    }
+  }
+  
+  test_flag_key = TEST_FLAG_IP_PORT;
   test_flag_val = testFlags.lookup_or_init(&test_flag_key, &zero32);
   if (test_flag_val) {
     if ((*test_flag_val) == ENABLE) {
@@ -107,142 +145,14 @@ int packet_filter(struct xdp_md *ctx) {
   event.eth_dest = eth_dest;
   eth_source = 0;
   eth_dest = 0;
+  event.eth_proto = htons(eth->h_proto);
 
-  u8 check_mac =0;
-
-  // MACアドレスの分類
-  //packet_events.perf_submit(ctx, &event, sizeof(event));
-  if (event.eth_dest == MAC_BROADCAST) { // ブロードキャストの場合
-    // MACのソースがサーバ等の装置なら通す
-    eth_source = event.eth_source;
-    u32 *val;
-    val = serverMAC.lookup_or_init(&eth_source, &zero32);
-    if (val) {
-      if ((*val) == ENABLE) {
-        //check_mac = 1;
-        return XDP_PASS;
-      }
-    }
-    if (check_mac ==0) { // MACチェックの結果が否の場合
-      // MACのソースアドレスが認められた端末か否かを確認
-      val = allowMAC.lookup_or_init(&eth_source, &zero32);
-      if (val) {
-        if ((*val) == ENABLE) {
-          check_mac = 1;
-        }
-      }
-    }
-    //if (check_mac ==0) { // MACチェックの結果が否の場合
-    //  // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
-    //  if (eth->h_proto == htons(ETH_P_IP)) {
-    //    struct iphdr *iph = data + nh_off;
-    //    if ((void*)&iph[1] > data_end)
-    //      return XDP_PASS;
-    //    event.protocol = iph->protocol;
-    //    event.v4_source = iph->saddr;
-    //    event.v4_dest = iph->daddr;
-    //  }
-    //  //packet_events.perf_submit(ctx, &event, sizeof(event));
-    //  //return XDP_DROP;
-    //}
-    //return XDP_PASS;
-  } else if ((event.eth_source & MAC_MULTICAST_MASK) > 0) { // マルチキャストの場合
-    // MACのソースがサーバ等の装置なら通す
-    eth_source = event.eth_source;
-    u32 *val;
-    val = serverMAC.lookup_or_init(&eth_source, &zero32);
-    if (val) {
-      if ((*val) == ENABLE) {
-        //check_mac = 1;
-        return XDP_PASS;
-      }
-    }
-    if (check_mac ==0) { // MACチェックの結果が否の場合
-      val = allowMAC.lookup_or_init(&eth_source, &zero32);
-      if (val) {
-        if ((*val) == ENABLE) {
-          check_mac = 1;
-        }
-      }
-    }
-    //if (check_mac ==0) { // MACチェックの結果が否の場合
-    //  // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
-    //  if (eth->h_proto == htons(ETH_P_IP)) {
-    //    struct iphdr *iph = data + nh_off;
-    //    if ((void*)&iph[1] > data_end)
-    //      return XDP_PASS;
-    //    event.protocol = iph->protocol;
-    //    event.v4_source = iph->saddr;
-    //    event.v4_dest = iph->daddr;
-    //  }
-    //  packet_events.perf_submit(ctx, &event, sizeof(event));
-    //  return XDP_DROP;
-    //}
-    //return XDP_PASS;
-  } else { // ユニキャストの場合
-    eth_source = event.eth_source;
-    u32 *val;
-    val = serverMAC.lookup_or_init(&eth_source, &zero32);
-    if (val) {
-      if ((*val) == ENABLE) {
-        //check_mac = 1;
-        return XDP_PASS;
-      }
-    }
-    val = allowMAC.lookup_or_init(&eth_source, &zero32);
-    if (val) {
-      if ((*val) == ENABLE) {
-        eth_dest = event.eth_dest;
-        val = serverMAC.lookup_or_init(&eth_dest, &zero32);
-        if (val) {
-          if ((*val) == ENABLE) {
-            check_mac = 1;
-          }
-        }
-      }
-    }
-    //if (check_mac ==0) { // MACチェックの結果が否の場合
-    //  // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
-    //  if (eth->h_proto == htons(ETH_P_IP)) {
-    //    struct iphdr *iph = data + nh_off;
-    //    if ((void*)&iph[1] > data_end)
-    //      return XDP_PASS;
-    //    event.protocol = iph->protocol;
-    //    event.v4_source = iph->saddr;
-    //    event.v4_dest = iph->daddr;
-    //  }
-    //  packet_events.perf_submit(ctx, &event, sizeof(event));
-    //  return XDP_DROP;
-    //}
-  }
-
-  if (test_flags.protocl != ENABLE) {
-    if (check_mac ==0) { // MACチェックの結果が否の場合
-      // IPレベルの情報を取得した上で，アプリ層に通知を出してパケット廃棄
-      if (eth->h_proto == htons(ETH_P_IP)) {
-        struct iphdr *iph = data + nh_off;
-        if ((void*)&iph[1] > data_end) {
-          //return XDP_PASS;
-          packet_events.perf_submit(ctx, &event, sizeof(event));
-          return XDP_DROP;
-        }
-        event.protocol = iph->protocol;
-        event.v4_source = iph->saddr;
-        event.v4_dest = iph->daddr;
-      }
-      packet_events.perf_submit(ctx, &event, sizeof(event));
-      return XDP_DROP;
-    } else {
-      return XDP_PASS;
-    }
-  }
-
-  if (eth->h_proto == htons(ETH_P_IP)) {
+  if (event.eth_proto == ETH_P_IP) {
     struct iphdr *iph = data + nh_off;
     if ((void*)&iph[1] > data_end)
       return XDP_PASS;
 
-    event.protocol = iph->protocol;
+    event.ip_protocol = iph->protocol;
     event.v4_source = iph->saddr;
     event.v4_dest = iph->daddr;
 
@@ -251,23 +161,156 @@ int packet_filter(struct xdp_md *ctx) {
       return XDP_PASS;
     }
 
+    if (event.ip_protocol == IPPROTO_TCP) {
+      struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
+      if ((void *)(tcp +1) > data_end) {
+        return XDP_PASS;
+      }
+      u32 tcp_header_len = tcp->doff *4;
+      if (tcp_header_len < sizeof (*tcp) || tcp_header_len > MAX_TCP_HEADER_BYTES) {
+        return XDP_PASS;
+      }
+      event.port_source = ntohs(tcp->source);
+      event.port_dest = ntohs(tcp->dest);
+    } else if (event.ip_protocol == IPPROTO_UDP) {
+      struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
+      if ((void *)(udp +1) > data_end) {
+        return XDP_PASS;
+      }
+      if (udp->len < sizeof (*udp) ) {
+            return XDP_PASS;
+      }
+      event.port_source = ntohs(udp->source);
+      event.port_dest = ntohs(udp->dest);
+    }
+  } else if (event.eth_proto == ETH_P_ARP) {
+    // Parse ARP header
+    struct arphdr_eth_ipv4 *arp = (void *)(eth + 1);
+    if ((void *)(arp + 1) > data_end)
+        return XDP_PASS;
+
+    // Validate: Ethernet hardware type, IPv4 protocol, correct lengths
+    if (arp->ar_hrd != bpf_htons(ARPHRD_ETHER) ||
+        arp->ar_pro != bpf_htons(ETH_P_IP) ||
+        arp->ar_hln != 6 ||
+        arp->ar_pln != 4)
+        return XDP_PASS;
+
+    event.arp_opcode = ntohs(arp->ar_op);
+    event.arp_source_ip = arp->ar_sip;
+    event.arp_target_ip = arp->ar_tip;
+    for (int i=0; i< ETH_ALEN ; i++) {
+      event.arp_source_mac = event.arp_source_mac << 8;
+      event.arp_target_mac = event.arp_target_mac << 8;
+      event.arp_source_mac = event.arp_source_mac | (arp->ar_sha[i]);
+      event.arp_target_mac = event.arp_target_mac | (arp->ar_tha[i]);
+    }
+  }
+
+  u8 check_mac =0;
+
+  // 宛先MACアドレスの種類による区別
+  if (event.eth_dest == MAC_BROADCAST) { // ブロードキャストの場合
+    // MACのソースがサーバ等の装置なら通す
+    eth_source = event.eth_source;
+    u32 *val;
+    val = serverMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        return XDP_PASS;
+      }
+    }
+    // MACのソースアドレスが認められた端末か否かを確認
+    val = allowMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        check_mac = 1;
+      }
+    }
+  } else if ((event.eth_dest & MAC_MULTICAST_MASK) > 0) { // マルチキャストの場合
+    // MACのソースがサーバ等の装置なら通す
+    eth_source = event.eth_source;
+    u32 *val;
+    val = serverMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        return XDP_PASS;
+      }
+    }
+    // MACのソースアドレスが認められた端末か否かを確認
+    val = allowMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        check_mac = 1;
+      }
+    }
+  } else { // ユニキャストの場合
+    // MACのソースがサーバ等の装置なら通す
+    eth_source = event.eth_source;
+    u32 *val;
+    val = serverMAC.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        return XDP_PASS;
+      }
+    }
+    // MACのソースアドレスが認められた端末か否かを確認
+    val = allowMacRuleMap.lookup_or_init(&eth_source, &zero32);
+    if (val) {
+      if ((*val) == ENABLE) {
+        // MACの宛先がサーバ類ならOKとする
+        eth_dest = event.eth_dest;
+        val = serverMAC.lookup_or_init(&eth_dest, &zero32);
+        if (val) {
+          if ((*val) == ENABLE) {
+            check_mac = 1;
+          }
+        } else {
+          check_mac = 2;
+        }
+      }
+    }
+  }
+
+  if (check_mac ==0) { // MACチェックの結果が否の場合
+    // アプリ層に通知を出してパケット廃棄
+    packet_events.perf_submit(ctx, &event, sizeof(event));
+    return XDP_DROP;
+  }
+
+  if (check_mac == 2) { // MACのソースが見とれられたもの，宛先がサーバ以外の場合はARP以外は廃棄
+    if (event.eth_proto != ETH_P_ARP) {
+      // アプリ層に通知を出してパケット廃棄
+      packet_events.perf_submit(ctx, &event, sizeof(event));
+      return XDP_DROP;
+    }
+  }
+
+  if (test_flags.eth_protocol != ENABLE) {
+    return XDP_PASS;
+  }
+
+  u32 *eth_protocol_val;
+  eth_protocol_val = allowArpOpCode.lookup_or_init(&event.eth_proto, &zero32);
+  if (eth_protocol_val) {
+    if ((*eth_protocol_val) != ENABLE) {
+      goto packet_drop;
+    }
+  } else {
+    goto packet_drop;
+  }
+
+  if (event.eth_proto == ETH_P_IP) {
+    if (test_flags.ip_protocol != ENABLE) {
+      return XDP_PASS;
+    }
     u32 *protocol_val;
-    protocol_val = allowProtocolList.lookup_or_init(&event.protocol, &zero32);
+    protocol_val = allowIpProtocolList.lookup_or_init(&event.protocol, &zero32);
     if (protocol_val) {
       if ((*protocol_val) != ENABLE) {
         goto packet_drop;
       } else {
         if (event.protocol == IPPROTO_TCP) {
-          struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
-          if ((void *)(tcp +1) > data_end) {
-            goto packet_pass;
-          }
-          u32 tcp_header_len = tcp->doff *4;
-          if (tcp_header_len < sizeof (*tcp) || tcp_header_len > MAX_TCP_HEADER_BYTES) {
-            goto packet_pass;
-          }
-          event.port_source = ntohs(tcp->source);
-          event.port_dest = ntohs(tcp->dest);
           if (test_flags.port != ENABLE) {
             goto packet_pass;
           }
@@ -283,15 +326,6 @@ int packet_filter(struct xdp_md *ctx) {
             goto packet_drop;
           }
         } else if (event.protocol == IPPROTO_UDP) {
-          struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
-          if ((void *)(udp +1) > data_end) {
-            goto packet_pass;
-          }
-          if (udp->len < sizeof (*udp) ) {
-            goto packet_pass;
-          }
-          event.port_source = ntohs(udp->source);
-          event.port_dest = ntohs(udp->dest);
           if (test_flags.port != ENABLE) {
             goto packet_pass;
           }
@@ -309,12 +343,21 @@ int packet_filter(struct xdp_md *ctx) {
         }
       }
     }
+  } else (event.eth_proto == ETH_P_ARP) {
+    if (test_flags.ip_protocol != ENABLE) {
+      return XDP_PASS;
+    }
+    u32 *arp_opcode_val;
+    arp_opcode_val = allowArpOpCode.lookup_or_init(&event.arp_opcode, &zero32);
+    if ((*arp_opcode_val) == ENABLE) {
+      goto packet_pass;
+    } else {
+      goto packet_drop;
+    }
   }
+
+
 packet_pass:
-  if (check_mac ==0) { // MACチェックの結果が否の場合
-    packet_events.perf_submit(ctx, &event, sizeof(event));
-    return XDP_DROP;
-  }
   return XDP_PASS;
 
 packet_drop:
@@ -336,9 +379,123 @@ def print_packet_event(cpu,data,size):
 
 
 serverMacList = [0x80027157b59]
-allowMacList = [0xcc96e5b8d450]
 
-allowProtocolList = [
+allowMAC = [
+  0xcc96e5b8d450
+]
+
+
+allowEthProtocolList = [
+0x0060, # ETH_P_LOOP       Ethernet Loopback packet
+0x0200, # ETH_P_PUP        Xerox PUP packet
+0x0201, # ETH_P_PUPAT      Xerox PUP Addr Trans packet
+0x22F0, # ETH_P_TSN        TSN (IEEE 1722) packet
+0x22EB, # ETH_P_ERSPAN2    ERSPAN version 2 (type III)
+0x0800, # ETH_P_IP         Internet Protocol packet
+0x0805, # ETH_P_X25        ITU-T X.25 / ISO-8208 Layer 3 packet
+0x0806, # ETH_P_ARP        Address Resolution packet
+0x08FF, # ETH_P_BPQ        G8BPQ AX.25 Ethernet Packet [ NOT AN OFFICIALLY REGISTERED ID ]
+0x0a00, # ETH_P_IEEEPUP    Xerox IEEE802.3 PUP packet
+0x0a01, # ETH_P_IEEEPUPAT  Xerox IEEE802.3 PUP Addr Trans packet
+0x4305, # ETH_P_BATMAN     B.A.T.M.A.N.-Advanced packet [ NOT AN OFFICIALLY REGISTERED ID ]
+0x6000, # ETH_P_DEC        DEC Assigned proto in frame
+0x6001, # ETH_P_DNA_DL     DEC DNA Dump/Load
+0x6002, # ETH_P_DNA_RC     DEC DNA Remote Console
+0x6003, # ETH_P_DNA_RT     DEC DNA Routing
+0x6004, # ETH_P_LAT        DEC LAT
+0x6005, # ETH_P_DIAG       DEC Diagnostics
+0x6006, # ETH_P_CUST       DEC Customer use
+0x6007, # ETH_P_SCA        DEC Systems Comms Arch
+0x6558, # ETH_P_TEB	       Trans Ether Bridging
+0x8035, # ETH_P_RARP       Reverse Addr Res packet
+0x809B, # ETH_P_ATALK      Appletalk DDP
+0x80F3, # ETH_P_AARP       Appletalk AARP
+0x8100, # ETH_P_8021Q      802.1Q VLAN Extended Header
+0x88BE, # ETH_P_ERSPAN     ERSPAN type II
+0x8137, # ETH_P_IPX        IPX over DIX
+0x86DD, # ETH_P_IPV6       IPv6 over bluebook
+0x8808, # ETH_P_PAUSE      IEEE Pause frames. See 802.3 31B
+0x8809, # ETH_P_SLOW       Slow Protocol. See 802.3
+0x883E, # ETH_P_WCCP       Web-cache coordination protocol defined in draft-wilson-wrec-wccp-v2-00.txt
+0x8847, # ETH_P_MPLS_UC    MPLS Unicast traffic
+0x8848, # ETH_P_MPLS_MC    MPLS Multicast traffic
+0x884c, # ETH_P_ATMMPOA    MultiProtocol Over ATM
+0x8863, # ETH_P_PPP_DISC   PPPoE discovery messages
+0x8864, # ETH_P_PPP_SES    PPPoE session messages
+0x886c, # ETH_P_LINK_CTL   HPNA, wlan link local tunnel
+0x8870, # ETH_P_8021AC     802.1AC LLC > 1500 bytes
+0x8884, # ETH_P_ATMFATE    Frame-based ATM Transport over Ethernet
+0x888E, # ETH_P_PAE        Port Access Entity (IEEE 802.1X)
+0x8892, # ETH_P_PROFINET   PROFINET Protocol
+0x8899, # ETH_P_REALTEK    Multiple proprietary protocols
+0x88A2, # ETH_P_AOE        ATA over Ethernet
+0x88A4, # ETH_P_ETHERCAT   EtherCAT
+0x88A8, # ETH_P_8021AD     802.1ad Service VLAN
+0x88B5, # ETH_P_802_EX1    802.1 Local Experimental 1.
+0x88C3, # ETH_P_MXLGSW     Infineon Technologies Corporate Research ST Used by MaxLinear GSW DSA
+0x88C7, # ETH_P_PREAUTH    802.11 Preauthentication
+0x88CA, # ETH_P_TIPC       TIPC
+0x88CC, # ETH_P_LLDP       Link Layer Discovery Protocol
+0x88E3, # ETH_P_MRP        Media Redundancy Protocol
+0x88E5, # ETH_P_MACSEC     IEEE 802.1AE MACsec
+0x88E7, # ETH_P_8021AH     802.1ah Backbone Service Tag
+0x88F5, # ETH_P_MVRP       802.1Q MVRP
+0x88F7, # ETH_P_1588       IEEE 1588 Timesync
+0x88F8, # ETH_P_NCSI       Network Controller Sideband Interface protocol
+0x88FB, # ETH_P_PRP        IEC 62439-3 PRP/HSRv0
+0x8902, # ETH_P_CFM        Connectivity Fault Management 
+0x8906, # ETH_P_FCOE       Fibre Channel over Ethernet
+0x8915, # ETH_P_IBOE       Infiniband over Ethernet
+0x890D, # ETH_P_TDLS       TDLS
+0x8914, # ETH_P_FIP        FCoE Initialization Protocol
+0x8917, # ETH_P_80221      IEEE 802.21 Media Independent Handover Protocol
+0x892F, # ETH_P_HSR        IEC 62439-3 HSRv1
+0x894F, # ETH_P_NSH        Network Service Header
+0x9000, # ETH_P_LOOPBACK   Ethernet Loopback packet, per IEEE 802.3
+0x9100, # ETH_P_QINQ1      deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ]
+0x9200, # ETH_P_QINQ2      deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ]
+0x9300, # ETH_P_QINQ3      deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ]
+0x9988, # ETH_P_YT921X     Motorcomm YT921x DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0xDADA, # ETH_P_EDSA       Ethertype DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0xDADB, # ETH_P_DSA_8021Q  Fake VLAN Header for DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0xE001, # ETH_P_DSA_A5PSW	 A5PSW Tag Value [ NOT AN OFFICIALLY REGISTERED ID ]
+0xED3E, # ETH_P_IFE        ForCES inter-FE LFB type
+0xFBFB, # ETH_P_AF_IUCV    IBM af_iucv [ NOT AN OFFICIALLY REGISTERED ID ]
+0xFD3A, # ETH_P_NXP_NETC   NXP NETC DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0x0600, # ETH_P_802_3_MIN  If the value in the ethernet type is more than this value then the frame is Ethernet II. Else it is 802.3
+# Non DIX types. Won't clash for 1500 types.
+0x0001, # ETH_P_802_3      Dummy type for 802.3 frames
+0x0002, # ETH_P_AX25       Dummy protocol id for AX.25
+0x0003, # ETH_P_ALL        Every packet (be careful!!!)
+0x0004, # ETH_P_802_2      802.2 frames
+0x0005, # ETH_P_SNAP       Internal only
+0x0006, # ETH_P_DDCMP      DEC DDCMP: Digital's own DDCMP protocol
+0x0007, # ETH_P_WAN_PPP    Dummy type for WAN PPP frames
+0x0008, # ETH_P_PPP_MP     Dummy type for PPP MP frames
+0x0009, # ETH_P_LOCALTALK  Localtalk pseudo type (AppleTalk)
+0x000C, # ETH_P_CAN        CAN   : Controller Area Network
+0x000D, # ETH_P_CANFD      CANFD : CAN Flexible Data-Rate
+0x000E, # ETH_P_CANXL      CANXL: eXtended frame Length
+0x0010, # ETH_P_PPPTALK    Dummy type for Atalk over PPP
+0x0011, # ETH_P_TR_802_2   802.2 frames
+0x0015, # ETH_P_MOBITEX    Mobitex
+0x0016, # ETH_P_CONTROL    Card specific control frames
+0x0017, # ETH_P_IRDA       Linux-IrDA
+0x0018, # ETH_P_ECONET     Acorn Econet
+0x0019, # ETH_P_HDLC       Synch HDLC
+0x001A, # ETH_P_ARCNET     1A for ArcNet
+0x001B, # ETH_P_DSA        Distributed Switch Architecture
+0x001C, # ETH_P_TRAILER    Trailer switch tagging
+0x00F5, # ETH_P_PHONET     Nokia Phonet frames
+0x00F6, # ETH_P_IEEE802154 IEEE802.15.4 frame
+0x00F7, # ETH_P_CAIF       ST-Ericsson CAIF protocol
+0x00F8, # ETH_P_XDSA       Multiplexed DSA protocol
+0x00F9, # ETH_P_MAP        Qualcomm multiplexing and aggregation protocol
+0x00FA, # ETH_P_MCTP       Management component transport protocol packets
+0x00FE, # ETH_P_GRE_OSI    GRE tunnels: LLC "fe fe 03" analog, used primarily for IS-IS over GRE. WARNING: not internal, used on wire!
+]
+
+allowIpProtocolList = [
 0,   # IPPROTO_IP
 1,   # IPPROTO_ICMP
 2,   # IPPROTO_IGMP
@@ -869,9 +1026,41 @@ allowPortListUDP = [
 1010, # TCP,     : ThinLinc Web Administration
 ]
 
+allowArpOpCode = [
+0, # Reserved                  RFC5494
+1, # ARP Request               RFC826, RFC5227
+2, # ARP Reply                 RFC826, RFC5227
+3, # Reverse ARP Request       RFC903
+4, # Reverse ARP Reply         RFC903
+5, # DARP Request              RFC1931
+6, # DARP Reply                RFC1931
+7, # DARP Error                RFC1931
+8, # Inverse ARP Request       RFC2390
+9, # Inverse ARP Reply         RFC2390
+10, # ARP NAK                  RFC1577
+11, # MARS Request             Grenville Armitage
+12, # MARS Multi               Grenville Armitage
+13, # MARS MServ               Grenville Armitage
+14, # MARS Join                Grenville Armitage
+15, # MARS Leave               Grenville Armitage
+16, # MARS NAK                 Grenville Armitage
+17, # MARS UnServ              Grenville Armitage
+18, # MARS SJoin               Grenville Armitage
+19, # MARS SLeave              Grenville Armitage
+20, # MARS Group List Request  Grenville Armitage
+21, # MARS Group List Repaly   Grenville Armitage
+22, # MARS Redirect Map        Grenville Armitage
+23, # MARS MAP OS UN ARP       Mitsuru Maruyama; RFC 2176
+24, # OP exp1                  RFC5494
+25, # OP exp2                  RFC5494
+65535, # Reserved 2            RFC5494
+]
+
+
 testFlags = [ # MACベースフィルタリングは無条件にON
-0, # プロトコルフィルタリング
-1, # ポート番号フィルタリング
+  0, # イーサネットレベルプロトコルフィルタリング
+  1, # IPプロトコルフィルタリング
+  2, # TCP/UDPポート番号フィルタリング
 ]
 
 b = BPF(text=bpf_text)
@@ -882,15 +1071,19 @@ device = "enp0s3"
 
 b.attach_xdp(device, fn)
 
-eth_test_flags_table = b.get_table("testFlags")
+test_flags_table = b.get_table("testFlags")
 
 eth_server_table = b.get_table("serverMAC")
 eth_allow_table = b.get_table("allowMAC")
 
-eth_allow_protocol_table = b.get_table("allowProtocolList")
+allow_eth_protocol_table = b.get_table("allowEthProtocolList")
 
-eth_allow_tcp_port_table = b.get_table("allowPortListTCP")
-eth_allow_udp_port_table = b.get_table("allowPortListUDP")
+allow_ip_protocol_table = b.get_table("allowIpProtocolList")
+
+allow_tcp_port_table = b.get_table("allowPortListTCP")
+allow_udp_port_table = b.get_table("allowPortListUDP")
+
+allow_arp_opcode_table = b.get_table("allowArpOpCode")
 
 b["packet_events"].open_perf_buffer(print_packet_event)
 
@@ -900,25 +1093,33 @@ enable=1
 
 # 有効にするテストのリストをハッシュテーブルに登録
 for i in testFlags:
-  eth_test_flags_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
+  test_flags_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
 
 # MACアドレスをハッシュテーブルに登録
 # allow
-for i in allowMacList:
+for i in allowMAC:
   eth_allow_table[ctypes.c_uint64(i)] = ctypes.c_uint32(enable)
 # server
 for i in serverMacList:
   eth_server_table[ctypes.c_uint64(i)] = ctypes.c_uint32(enable)
 
 # プロトコル番号をハッシュテーブルに登録
-for i in allowProtocolList:
-  eth_allow_protocol_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
+for i in allowEthProtocolList:
+  allow_eth_protocol_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
+
+# IPプロトコル番号をハッシュテーブルに登録
+for i in allowIpProtocolList:
+  allow_ip_protocol_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
 
 # ポート番号をハッシュテーブルに登録
 for i in allowPortListTCP:
-  eth_allow_tcp_port_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
+  allow_tcp_port_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
 for i in allowPortListUDP:
-  eth_allow_udp_port_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
+  allow_udp_port_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
+
+# ARPのOpcodeをハッシュテーブルに登録
+for i in allowArpOpCode:
+  allow_arp_opcode_table[ctypes.c_uint32(i)] = ctypes.c_uint32(enable)
 
 while True:
   try:

@@ -1,0 +1,662 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from bcc import BPF
+from bcc.utils import printb
+from socket import inet_ntop, AF_INET, AF_INET6
+from struct import pack
+import sys
+import time
+import ctypes
+
+
+bpf_text = """
+//#include <uapi/linux/bpf.h>
+//#include <bpf/bpf.h>
+#include <linux/bpf.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/in.h>
+#include <linux/if_ether.h>
+//#include <linux/if_arp.h>
+//#include <bpf/bpf_endian.h>
+//#include <bpf/bpf_helpers.h>
+
+
+#define MAX_TCP_HEADER_BYTES 60
+
+#define MAC_BROADCAST    0xFFFFFFFFFFFF
+#define MAC_MULTICAST_MASK 0x800000000000
+
+#define ENABLE 1
+#define DISABLE 0
+
+struct arphdr_eth_ipv4 {
+    __be16 ar_hrd;      // Hardware type (Ethernet = 1)
+    __be16 ar_pro;      // Protocol type (IPv4 = 0x0800)
+    __u8   ar_hln;      // Hardware address length (6 for MAC)
+    __u8   ar_pln;      // Protocol address length (4 for IPv4)
+    __be16 ar_op;        // ARP operation (1 = request, 2 = reply)
+    __u8   ar_sha[6];   // Sender hardware address (MAC)
+    __be32 ar_sip;      // Sender IP address
+    __u8   ar_tha[6];   // Target hardware address (MAC)
+    __be32 ar_tip;      // Target IP address
+} __attribute__((packed));
+
+
+struct packet_event_t {
+  u16 eth_proto;
+  u64 eth_source, eth_dest;
+  u32 ip_protocol;
+  u32 v4_source, v4_dest;
+  u16 port_source, port_dest;
+  u16 arp_opcode;
+  u32 arp_source_ip, arp_target_ip;
+  u64 arp_source_mac, arp_target_mac;
+};
+
+BPF_PERF_OUTPUT(packet_events);
+
+int packet_capture(struct xdp_md *ctx) {
+  void* data_end = (void*)(long)ctx->data_end;
+  void* data = (void*)(long)ctx->data;
+  struct ethhdr *eth = data;
+  u64 zero64=0;
+  u32 zero32=0;
+  u16 zero16=0;
+  u64 nh_off = sizeof(*eth);
+  u64 eth_source, eth_dest;
+  struct packet_event_t event;
+  event.eth_source = zero64;
+  event.eth_dest = zero64;
+  event.eth_proto = zero16;
+  event.ip_protocol = zero32;
+  event.v4_source = zero32;
+  event.v4_dest = zero32;
+  event.port_source = zero16;
+  event.port_dest = zero16;
+  event.arp_opcode = zero16;
+  event.arp_source_ip = zero32;
+  event.arp_target_ip = zero32;
+  event.arp_source_mac = zero64;
+  event.arp_target_mac = zero64;
+
+  if (data + nh_off > data_end)
+    return XDP_PASS;
+
+  for (int i=0; i< ETH_ALEN ; i++) {
+    eth_source = eth_source << 8;
+    eth_dest = eth_dest << 8;
+    eth_source = eth_source | (eth->h_source[i]);
+    eth_dest = eth_dest | (eth->h_dest[i]);
+  }
+  event.eth_source = eth_source;
+  event.eth_dest = eth_dest;
+  event.eth_proto = htons(eth->h_proto);
+
+  if (event.eth_proto == ETH_P_IP) {
+    struct iphdr *iph = data + nh_off;
+    if ((void*)&iph[1] > data_end)
+      return XDP_PASS;
+
+    event.ip_protocol = iph->protocol;
+    event.v4_source = iph->saddr;
+    event.v4_dest = iph->daddr;
+
+    int ip_hdr_len = iph->ihl *4;
+    if (ip_hdr_len < sizeof(struct iphdr)) {
+      return XDP_PASS;
+    }
+
+    if (event.ip_protocol == IPPROTO_TCP) {
+      struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
+      if ((void *)(tcp +1) > data_end) {
+        return XDP_PASS;
+      }
+      u32 tcp_header_len = tcp->doff *4;
+      if (tcp_header_len < sizeof (*tcp) || tcp_header_len > MAX_TCP_HEADER_BYTES) {
+        return XDP_PASS;
+      }
+      event.port_source = ntohs(tcp->source);
+      event.port_dest = ntohs(tcp->dest);
+    } else if (event.ip_protocol == IPPROTO_UDP) {
+      struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
+      if ((void *)(udp +1) > data_end) {
+        return XDP_PASS;
+      }
+      if (udp->len < sizeof (*udp) ) {
+            return XDP_PASS;
+      }
+      event.port_source = ntohs(udp->source);
+      event.port_dest = ntohs(udp->dest);
+    }
+  } else if (event.eth_proto == ETH_P_ARP) {
+    // Parse ARP header
+    struct arphdr_eth_ipv4 *arp = (void *)(eth + 1);
+    if ((void *)(arp + 1) > data_end)
+        return XDP_PASS;
+
+    // Validate: Ethernet hardware type, IPv4 protocol, correct lengths
+    if (arp->ar_hrd != bpf_htons(ARPHRD_ETHER) ||
+        arp->ar_pro != bpf_htons(ETH_P_IP) ||
+        arp->ar_hln != 6 ||
+        arp->ar_pln != 4)
+        return XDP_PASS;
+
+    event.arp_opcode = ntohs(arp->ar_op);
+    event.arp_source_ip = arp->ar_sip;
+    event.arp_target_ip = arp->ar_tip;
+    for (int i=0; i< ETH_ALEN ; i++) {
+      event.arp_source_mac = event.arp_source_mac << 8;
+      event.arp_target_mac = event.arp_target_mac << 8;
+      event.arp_source_mac = event.arp_source_mac | (arp->ar_sha[i]);
+      event.arp_target_mac = event.arp_target_mac | (arp->ar_tha[i]);
+    }
+  }
+
+  packet_events.perf_submit(ctx, &event, sizeof(event));
+  return XDP_PASS;
+}
+"""
+
+ethProtocolList = {
+0x0060 : "Ethernet Loopback packet",                        # ETH_P_LOOP       Ethernet Loopback packet
+0x0200 : "Xerox PUP packet",                                # ETH_P_PUP        Xerox PUP packet
+0x0201 : "Xerox PUP Addr Trans packet",                     # ETH_P_PUPAT      Xerox PUP Addr Trans packet
+0x22F0 : "TSN (IEEE 1722) packet",                          # ETH_P_TSN        TSN (IEEE 1722) packet
+0x22EB : "ERSPAN version 2 (type III)",                     # ETH_P_ERSPAN2    ERSPAN version 2 (type III)
+0x0800 : "Internet Protocol packet",                        # ETH_P_IP         Internet Protocol packet
+0x0805 : "ITU-T X.25 Layer 3 packet",                       # ETH_P_X25        ITU-T X.25 / ISO-8208 Layer 3 packet
+0x0806 : "Address Resolution packet",                       # ETH_P_ARP        Address Resolution packet
+0x08FF : "G8BPQ AX.25 Ethernet Packet",                     # ETH_P_BPQ        G8BPQ AX.25 Ethernet Packet [ NOT AN OFFICIALLY REGISTERED ID ]
+0x0a00 : "Xerox IEEE802.3 PUP packet",                      # ETH_P_IEEEPUP    Xerox IEEE802.3 PUP packet
+0x0a01 : "Xerox IEEE802.3 PUP Addr Trans packet",           # ETH_P_IEEEPUPAT  Xerox IEEE802.3 PUP Addr Trans packet
+0x4305 : "B.A.T.M.A.N.-Advanced packet",                    # ETH_P_BATMAN     B.A.T.M.A.N.-Advanced packet [ NOT AN OFFICIALLY REGISTERED ID ]
+0x6000 : "DEC Assigned proto in frame",                     # ETH_P_DEC        DEC Assigned proto in frame
+0x6001 : "DEC DNA Dump/Load",                               # ETH_P_DNA_DL     DEC DNA Dump/Load
+0x6002 : "DEC DNA Remote Console",                          # ETH_P_DNA_RC     DEC DNA Remote Console
+0x6003 : "DEC DNA Routing",                                 # ETH_P_DNA_RT     DEC DNA Routing
+0x6004 : "DEC LAT",                                         # ETH_P_LAT        DEC LAT
+0x6005 : "DEC Diagnostics",                                 # ETH_P_DIAG       DEC Diagnostics
+0x6006 : "DEC Customer use",                                # ETH_P_CUST       DEC Customer use
+0x6007 : "DEC Systems Comms Arch",                          # ETH_P_SCA        DEC Systems Comms Arch
+0x6558 : "Trans Ether Bridging",                            # ETH_P_TEB	       Trans Ether Bridging
+0x8035 : "Reverse Addr Res packet",                         # ETH_P_RARP       Reverse Addr Res packet
+0x809B : "Appletalk DDP",                                   # ETH_P_ATALK      Appletalk DDP
+0x80F3 : "Appletalk AARP",                                  # ETH_P_AARP       Appletalk AARP
+0x8100 : "802.1Q VLAN Extended Header",                     # ETH_P_8021Q      802.1Q VLAN Extended Header
+0x88BE : "ERSPAN type II",                                  # ETH_P_ERSPAN     ERSPAN type II
+0x8137 : "IPX over DIX",                                    # ETH_P_IPX        IPX over DIX
+0x86DD : "IPv6 over bluebook",                              # ETH_P_IPV6       IPv6 over bluebook
+0x8808 : "IEEE Pause frames. See 802.3 31B",                # ETH_P_PAUSE      IEEE Pause frames. See 802.3 31B
+0x8809 : "Slow Protocol. See 802.3",                        # ETH_P_SLOW       Slow Protocol. See 802.3
+0x883E : "Web-cache coordination protocol",                 # ETH_P_WCCP       Web-cache coordination protocol defined in draft-wilson-wrec-wccp-v2-00.txt
+0x8847 : "MPLS Unicast traffic",                            # ETH_P_MPLS_UC    MPLS Unicast traffic
+0x8848 : "MPLS Multicast traffic",                          # ETH_P_MPLS_MC    MPLS Multicast traffic
+0x884c : "MultiProtocol Over ATM",                          # ETH_P_ATMMPOA    MultiProtocol Over ATM
+0x8863 : "PPPoE discovery messages",                        # ETH_P_PPP_DISC   PPPoE discovery messages
+0x8864 : "PPPoE session messages",                          # ETH_P_PPP_SES    PPPoE session messages
+0x886c : "HPNA, wlan link local tunnel",                    # ETH_P_LINK_CTL   HPNA, wlan link local tunnel
+0x8870 : "802.1AC LLC > 1500 bytes",                        # ETH_P_8021AC     802.1AC LLC > 1500 bytes
+0x8884 : "Frame-based ATM Transport over Ethernet",         # ETH_P_ATMFATE    Frame-based ATM Transport over Ethernet
+0x888E : "Port Access Entity (IEEE 802.1X)",                # ETH_P_PAE        Port Access Entity (IEEE 802.1X)
+0x8892 : "PROFINET Protocol",                               # ETH_P_PROFINET   PROFINET Protocol
+0x8899 : "Multiple proprietary protocols",                  # ETH_P_REALTEK    Multiple proprietary protocols
+0x88A2 : "ATA over Ethernet",                               # ETH_P_AOE        ATA over Ethernet
+0x88A4 : "EtherCAT",                                        # ETH_P_ETHERCAT   EtherCAT
+0x88A8 : "802.1ad Service VLAN",                            # ETH_P_8021AD     802.1ad Service VLAN
+0x88B5 : "802.1 Local Experimental 1.",                     # ETH_P_802_EX1    802.1 Local Experimental 1.
+0x88C3 : "Infineon Technologies Corporate Research ST",     # ETH_P_MXLGSW     Infineon Technologies Corporate Research ST Used by MaxLinear GSW DSA
+0x88C7 : "802.11 Preauthentication",                        # ETH_P_PREAUTH    802.11 Preauthentication
+0x88CA : "TIPC",                                            # ETH_P_TIPC       TIPC
+0x88CC : "Link Layer Discovery Protocol",                   # ETH_P_LLDP       Link Layer Discovery Protocol
+0x88E3 : "Media Redundancy Protocol",                       # ETH_P_MRP        Media Redundancy Protocol
+0x88E5 : "IEEE 802.1AE MACsec",                             # ETH_P_MACSEC     IEEE 802.1AE MACsec
+0x88E7 : "802.1ah Backbone Service Tag",                    # ETH_P_8021AH     802.1ah Backbone Service Tag
+0x88F5 : "802.1Q MVRP",                                     # ETH_P_MVRP       802.1Q MVRP
+0x88F7 : "IEEE 1588 Timesync",                              # ETH_P_1588       IEEE 1588 Timesync
+0x88F8 : "Network Controller Sideband Interface protocol",  # ETH_P_NCSI       Network Controller Sideband Interface protocol
+0x88FB : "IEC 62439-3 PRP/HSRv0",                           # ETH_P_PRP        IEC 62439-3 PRP/HSRv0
+0x8902 : "Connectivity Fault Management",                   # ETH_P_CFM        Connectivity Fault Management 
+0x8906 : "Fibre Channel over Ethernet",                     # ETH_P_FCOE       Fibre Channel over Ethernet
+0x8915 : "Infiniband over Ethernet",                        # ETH_P_IBOE       Infiniband over Ethernet
+0x890D : "TDLS",                                            # ETH_P_TDLS       TDLS
+0x8914 : "FCoE Initialization Protocol",                    # ETH_P_FIP        FCoE Initialization Protocol
+0x8917 : "IEEE 802.21 Media Independent Handover Protocol", # ETH_P_80221      IEEE 802.21 Media Independent Handover Protocol
+0x892F : "IEC 62439-3 HSRv1",                               # ETH_P_HSR        IEC 62439-3 HSRv1
+0x894F : "Network Service Header",                          # ETH_P_NSH        Network Service Header
+0x9000 : "Ethernet Loopback packet",                        # ETH_P_LOOPBACK   Ethernet Loopback packet, per IEEE 802.3
+0x9100 : "deprecated QinQ VLAN",                            # ETH_P_QINQ1      deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ]
+0x9200 : "deprecated QinQ VLAN",                            # ETH_P_QINQ2      deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ]
+0x9300 : "deprecated QinQ VLAN",                            # ETH_P_QINQ3      deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ]
+0x9988 : "Motorcomm YT921x DSA",                            # ETH_P_YT921X     Motorcomm YT921x DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0xDADA : "Ethertype DSA",                                   # ETH_P_EDSA       Ethertype DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0xDADB : "Fake VLAN Header for DSA",                        # ETH_P_DSA_8021Q  Fake VLAN Header for DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0xE001 : "A5PSW Tag Value",                                 # ETH_P_DSA_A5PSW	 A5PSW Tag Value [ NOT AN OFFICIALLY REGISTERED ID ]
+0xED3E : "ForCES inter-FE LFB type",                        # ETH_P_IFE        ForCES inter-FE LFB type
+0xFBFB : "IBM af_iucv",                                     # ETH_P_AF_IUCV    IBM af_iucv [ NOT AN OFFICIALLY REGISTERED ID ]
+0xFD3A : "NXP NETC DSA",                                    # ETH_P_NXP_NETC   NXP NETC DSA [ NOT AN OFFICIALLY REGISTERED ID ]
+0x0600 : "Ethernet II",                                     # ETH_P_802_3_MIN  If the value in the ethernet type is more than this value then the frame is Ethernet II. Else it is 802.3
+# Non DIX types. Won't clash for 1500 types.
+0x0001 : "Dummy type for 802.3 frames",                     # ETH_P_802_3      Dummy type for 802.3 frames
+0x0002 : "Dummy protocol id for AX.25",                     # ETH_P_AX25       Dummy protocol id for AX.25
+0x0003 : "Every packet (be careful!!!)",                    # ETH_P_ALL        Every packet (be careful!!!)
+0x0004 : "802.2 frames",                                    # ETH_P_802_2      802.2 frames
+0x0005 : "Internal only",                                   # ETH_P_SNAP       Internal only
+0x0006 : "DEC DDCMP: Digital's own DDCMP protocol",         # ETH_P_DDCMP      DEC DDCMP: Digital's own DDCMP protocol
+0x0007 : "Dummy type for WAN PPP frames",                   # ETH_P_WAN_PPP    Dummy type for WAN PPP frames
+0x0008 : "Dummy type for PPP MP frames",                    # ETH_P_PPP_MP     Dummy type for PPP MP frames
+0x0009 : "Localtalk pseudo type (AppleTalk)",               # ETH_P_LOCALTALK  Localtalk pseudo type (AppleTalk)
+0x000C : "CAN   : Controller Area Network",                 # ETH_P_CAN        CAN   : Controller Area Network
+0x000D : "CANFD : CAN Flexible Data-Rate",                  # ETH_P_CANFD      CANFD : CAN Flexible Data-Rate
+0x000E : "CANXL: eXtended frame Length",                    # ETH_P_CANXL      CANXL: eXtended frame Length
+0x0010 : "Dummy type for Atalk over PPP",                   # ETH_P_PPPTALK    Dummy type for Atalk over PPP
+0x0011 : "802.2 frames",                                    # ETH_P_TR_802_2   802.2 frames
+0x0015 : "Mobitex",                                         # ETH_P_MOBITEX    Mobitex
+0x0016 : "Card specific control frames",                    # ETH_P_CONTROL    Card specific control frames
+0x0017 : "Linux-IrDA",                                      # ETH_P_IRDA       Linux-IrDA
+0x0018 : "Acorn Econet",                                    # ETH_P_ECONET     Acorn Econet
+0x0019 : "Synch HDLC",                                      # ETH_P_HDLC       Synch HDLC
+0x001A : "1A for ArcNet",                                   # ETH_P_ARCNET     1A for ArcNet
+0x001B : "Distributed Switch Architecture",                 # ETH_P_DSA        Distributed Switch Architecture
+0x001C : "Trailer switch tagging",                          # ETH_P_TRAILER    Trailer switch tagging
+0x00F5 : "Nokia Phonet frames",                             # ETH_P_PHONET     Nokia Phonet frames
+0x00F6 : "IEEE802.15.4 frame",                              # ETH_P_IEEE802154 IEEE802.15.4 frame
+0x00F7 : "ST-Ericsson CAIF protocol",                       # ETH_P_CAIF       ST-Ericsson CAIF protocol
+0x00F8 : "Multiplexed DSA protocol",                        # ETH_P_XDSA       Multiplexed DSA protocol
+0x00F9 : "Qualcomm multiplexing and aggregation protocol",  # ETH_P_MAP        Qualcomm multiplexing and aggregation protocol
+0x00FA : "Management component transport protocol packets", # ETH_P_MCTP       Management component transport protocol packets
+0x00FE : "GRE tunnels",                                     # ETH_P_GRE_OSI    GRE tunnels: LLC "fe fe 03" analog, used primarily for IS-IS over GRE. WARNING: not internal, used on wire!
+}
+
+ipProtocolList = {
+0   : "Dummy protocol for TCP",                     # IPPROTO_IP          Dummy protocol for TCP
+1   : "Internet Control Message Protocol",          # IPPROTO_ICMP        Internet Control Message Protocol
+2   : "Internet Group Management Protocol",         # IPPROTO_IGMP        Internet Group Management Protocol
+4   : "IPv4-in-IPv4 tunneling",                     # IPPROTO_IPIP        IPv4-in-IPv4 tunneling
+6   : "Transmission Control Protocol",              # IPPROTO_TCP         Transmission Control Protocol
+8   : "Exterior Gateway Protocol",                  # IPPROTO_EGP         Exterior Gateway Protocol
+12  : "PUP protocol",                               # IPPROTO_PUP         PUP protocol
+17  : "User Datagram Protocol",                     # IPPROTO_UDP         User Datagram Protocol
+22  : "XNS IDP protocol",                           # IPPROTO_IDP         XNS IDP protocol
+29  : "SO Transport Protocol Class 4",              # IPPROTO_TP          SO Transport Protocol Class 4
+33  : "Datagram Congestion Control Protocol",       # IPPROTO_DCCP        Datagram Congestion Control Protocol
+41  : "IPv6-in-IPv4 tunnelling",                    # IPPROTO_IPV6        IPv6-in-IPv4 tunnelling
+46  : "Resource Reservation Protocol",              # IPPROTO_RSVP        Resource Reservation Protocol
+47  : "Cisco GRE tunnels",                          # IPPROTO_GRE         Cisco GRE tunnels (rfc 1701,1702)
+50  : "Encapsulation Security Payload protocol",    # IPPROTO_ESP         Encapsulation Security Payload protocol
+51  : "Authentication Header protocol",             # IPPROTO_AH          Authentication Header protocol
+92  : "Multicast Transport Protocol",               # IPPROTO_MTP         Multicast Transport Protocol
+94  : "IP option pseudo header for BEET",           # IPPROTO_BEETPH      IP option pseudo header for BEET (Binary Encapsulation for Tunneling Protocol)
+98  : "Encapsulation protocol",                     # IPPROTO_ENCAP
+103 : "Protocol Independent Multicast",             # IPPROTO_PIM
+108 : "Compression Header Protocol",                # IPPROTO_COMP
+115 : "Layer 2 Tunnelling Protocol",                # IPPROTO_L2TP
+132 : "Stream Control Transport Protocol",          # IPPROTO_SCTP
+136 : "UDP-Lite protocol (RFC 3828)",               # IPPROTO_UDPLITE
+137 : "Multi-Protocol Label Switching in IP",       # IPPROTO_MPLS        Multi-Protocol Label Switching in IP (RFC 4023)
+143 : "Ethernet-within-IPv6 Encapsulation",         # IPPROTO_ETHERNET
+144 : "Aggregation Fragmentation Protocol in ESP",  # IPPROTO_AGGFRAG     Aggregation Fragmentation Protocol in ESP (RFC 9347)
+255 : "Raw IP packets",                             # IPPROTO_RAW         Raw IP packets
+256 : "Shared Memory Communications",               # IPPROTO_SMC         Shared Memory Communications
+262 : "Multipath TCP connection",                   # IPPROTO_MPTCP       Multipath TCP connection
+}
+
+ipPortList = {
+1 : "TCP Port Service Multiplexer",                                    # TCP, UDP : TCP Port Service Multiplexer
+2 : "CompressNET Management Utility",                                  # TCP, UDP : CompressNET Management Utility
+3 : "CompressNET Compression Process",                                 # TCP, UDP : CompressNET Compression Process
+5 : "Remote Job Entry",                                                # TCP, UDP : Remote Job Entry
+7 : "Echo Protocol",                                                   # TCP, UDP : Echo Protocol
+9 : "Discard Protocol or Wake-on-LAN",                                 # TCP, UDP : Discard Protocol or Wake-on-LAN
+11 : "Active Users (systat)",                                          # TCP, UDP : Active Users (systat service)
+13 : "Daytime Protocol",                                               # TCP, UDP : Daytime Protocol (RFC 867)
+15 : "netstat service",                                                # TCP, UDP : Previously netstat service
+17 : "Quote of the Day",                                               # TCP, UDP : Quote of the Day
+18 : "Message send protocol",                                          # TCP, UDP : Message send protocol
+19 : "Character Generator Protocol",                                   # TCP, UDP : Character Generator Protocol (RFC 864)
+20 : "FTP data port",                                                  # TCP, UDP : FTP data port
+21 : "FTP control port",                                               # TCP, UDP : FTP control port
+22 : "SSH",                                                            # TCP, UDP : SSH
+23 : "telnet",                                                         # TCP, UDP : telnet
+24 : "Priv-mail",                                                      # TCP, UDP : Priv-mail
+25 : "Simple Mail Transfer Protocol (SMTP)",                           # TCP, UDP : Simple Mail Transfer Protocol (SMTP)
+27 : "NSW User System FE",                                             # TCP, UDP : NSW User System FE
+29 : "MSG ICP",                                                        # TCP, UDP : MSG ICP
+33 : "Display Support Protocol",                                       # TCP, UDP : Display Support Protocol
+35 : "Printer server",                                                 # TCP, UDP : Printer server
+37 : "Time Protocol",                                                  # TCP, UDP : Time Protocol
+39 : "Resource Location Protocol",                                     # TCP, UDP : Resource Location Protocol
+42 : "ARPA Host Name Server Protocol",                                 # TCP, UDP : ARPA Host Name Server Protocol / Windows Internet Name Service
+43 : "WHOIS protocol",                                                 # TCP, UDP : WHOIS protocol
+47 : "NI FTP",                                                         # TCP, UDP : NI FTP
+49 : "TACACS+ Login Host protocol",                                    # TCP, UDP : TACACS+ Login Host protocol
+51 : "IMP Logical Address Maintenance",                                # TCP, UDP : IMP Logical Address Maintenance
+52 : "XNS (Xerox Network Systems) Time Protocol",                      # TCP, UDP : XNS (Xerox Network Systems) Time Protocol
+53 : "Domain Name System (DNS)",                                       # TCP, UDP : Domain Name System (DNS)
+54 : "Xerox Network Systems (XNS) clearinghouse",                      # TCP, UDP : Xerox Network Systems (XNS) clearinghouse
+55 : "ISI Graphics Language (ISI-GL)",                                 # TCP, UDP : ISI Graphics Language (ISI-GL)
+56 : "Xerox Network Systems (XNS) authentication",                     # TCP, UDP : Xerox Network Systems (XNS) authentication / Route Access Protocol (RAP)
+58 : "Xerox Network Systems (XNS) Mail",                               # TCP, UDP : Xerox Network Systems (XNS) Mail
+64 : "CI (Travelport) Comms Integrator",                               # TCP, UDP : CI (Travelport) (formerly Covia) Comms Integrator
+67 : "Bootstrap Protocol (BOOTP) server",                              # TCP, UDP : Bootstrap Protocol (BOOTP) サーバ
+68 : "Bootstrap Protocol (BOOTP) client",                              # TCP, UDP : Bootstrap Protocol (BOOTP) クライアント
+69 : "Trivial File Transfer Protocol (TFTP)",                          # TCP, UDP : Trivial File Transfer Protocol (TFTP)
+70 : "Gopher protocol",                                                # TCP, UDP : Gopher protocol
+71 : "NETRJS protocol",                                                # TCP, UDP : NETRJS protocol
+74 : "NETRJS protocol",                                                # TCP, UDP : NETRJS protocol
+77 : "Any private remote job entry",                                   # TCP, UDP : Any private remote job entry
+79 : "Finger protocol",                                                # TCP, UDP : Finger protocol
+80 : "Hypertext Transfer Protocol (HTTP)",                             # TCP, UDP : Hypertext Transfer Protocol (HTTP)
+88 : "Kerberos",                                                       # TCP, UDP : Kerberos
+90 : "PointCast",                                                      # TCP, UDP : dnsix (DoD Network Security for Information Exchange) Security Attribute Token Map / PointCast
+99 : "WIP Message",                                                    # TCP,     : WIP Messageプロトコル
+100 : "CyberGate RAT",                                                 #    , UDP : CyberGate RATプロトコル
+101 : "NIC host name",                                                 # TCP, UDP : NICホスト名
+102 : "ISO Transport Service Access Point (TSAP) Class 0 protocol",    # TCP, UDP : ISO Transport Service Access Point (TSAP) Class 0 protocol; also used by Digital Equipment Corporation DECnet (Phase V+) over TCP/IP
+104 : "ACR/NEMA DICOM",                                                # TCP, UDP : ACR/NEMA DICOM
+105 : "CCSO Nameserver Protocol (Qi/Ph)",                              # TCP, UDP : CCSO Nameserver Protocol (Qi/Ph)
+107 : "Remote TELNET Service protocol",                                # TCP, UDP : Remote TELNET Service protocol
+108 : "SNA Gateway Access Server",                                     # TCP, UDP : SNA Gateway Access Server
+109 : "Post Office Protocol v2 (POP2)",                                # TCP, UDP : Post Office Protocol v2 (POP2)
+110 : "Post Office Protocol v3 (POP3)",                                # TCP, UDP : Post Office Protocol v3 (POP3)
+111 : "ONC RPC (Sun RPC)",                                             # TCP, UDP : ONC RPC (Sun RPC)
+113 : "Ident, authentication service",                                 # TCP,     : Ident, authentication service/identification protocol, used by IRC servers to identify users
+                                                                       #    , UDP : Authentication Service (auth)
+115 : "Simple File Transfer Protocol",                                 # TCP,     : Simple File Transfer Protocol
+117 : "UUCP Path Service",                                             # TCP, UDP : UUCP Path Service
+118 : "Structured Query Language (SQL) Services",                      # TCP, UDP : Structured Query Language (SQL) Services
+119 : "Network News Transfer Protocol (NNTP)",                         # TCP,     : Network News Transfer Protocol (NNTP), retrieval of newsgroup messages
+123 : "Network Time Protocol (NTP)",                                   # TCP, UDP : Network Time Protocol (NTP)
+126 : "Unisys Unitary Login",                                          # TCP, UDP : Formerly Unisys Unitary Login, renamed by Unisys to NXEdit. Used by Unisys Programmer's Workbench for Clearpath MCP, an IDE for Unisys MCP software development
+135 : "DCE endpoint resolution",                                       # TCP, UDP : DCE endpoint resolution
+137 : "NetBIOS Name Service",                                          # TCP, UDP : NetBIOS Name Service
+138 : "NetBIOS Datagram Service",                                      # TCP, UDP : NetBIOS Datagram Service
+139 : "NetBIOS Session Service",                                       # TCP, UDP : NetBIOS Session Service
+143 : "Internet Message Access Protocol (IMAP)",                       # TCP,     : Internet Message Access Protocol (IMAP), management of email messages
+152 : "Background File Transfer Program (BFTP)",                       # TCP, UDP : Background File Transfer Program (BFTP)
+153 : "Simple Gateway Monitoring Protocol (SGMP)",                     # TCP, UDP : Simple Gateway Monitoring Protocol (SGMP)
+156 : "SQL Service",                                                   # TCP, UDP : SQL Service
+158 : "Distributed Mail Service Protocol (DMSP)",                      # TCP, UDP : Distributed Mail Service Protocol (DMSP)
+161 : "Simple Network Management Protocol (SNMP)",                     #    , UDP : Simple Network Management Protocol (SNMP)
+162 : "Simple Network Management Protocol Trap (SNMPTRAP)",            # TCP, UDP : Simple Network Management Protocol Trap (SNMPTRAP)
+170 : "Print-srv, Network PostScript",                                 # TCP,     : Print-srv, Network PostScript
+175 : "VMNET (IBM z/VM, z/OS & z/VSE Network Job Entry (NJE))",        # TCP,     : VMNET (IBM z/VM, z/OS & z/VSE Network Job Entry (NJE))
+177 : "X Display Manager Control Protocol (XDMCP)",                    # TCP, UDP : X Display Manager Control Protocol (XDMCP)
+179 : "Border Gateway Protocol (BGP)",                                 # TCP,     : Border Gateway Protocol (BGP)
+194 : "Internet Relay Chat (IRC)",                                     # TCP, UDP : Internet Relay Chat (IRC)
+199 : "SMUX, SNMP Unix Multiplexer",                                   # TCP, UDP : SMUX, SNMP Unix Multiplexer
+201 : "AppleTalk Routing Maintenance",                                 # TCP, UDP : AppleTalk Routing Maintenance
+209 : "Quick Mail Transfer Protocol",                                  # TCP, UDP : Quick Mail Transfer Protocol
+210 : "ANSI Z39.50",                                                   # TCP, UDP : ANSI Z39.50
+213 : "Internetwork Packet Exchange (IPX)",                            # TCP, UDP : Internetwork Packet Exchange (IPX)
+218 : "Message posting protocol (MPP)",                                # TCP, UDP : Message posting protocol (MPP)
+220 : "Internet Message Access Protocol (IMAP), version 3",            # TCP, UDP : Internet Message Access Protocol (IMAP), version 3
+259 : "Efficient Short Remote Operations (ESRO)",                      # TCP, UDP : Efficient Short Remote Operations (ESRO)
+262 : "Arcisdms",                                                      # TCP, UDP : Arcisdms
+264 : "Border Gateway Multicast Protocol (BGMP)",                      # TCP, UDP : Border Gateway Multicast Protocol (BGMP)
+280 : "http-mgmt",                                                     # TCP, UDP : http-mgmt
+300 : "ThinLinc Web Access",                                           # TCP,     : ThinLinc Web Access
+308 : "Novastor Online Backup",                                        # TCP,     : Novastor Online Backup
+311 : "macOS Server Admin (AppleShare IP Web administration)",         # TCP,     : macOS Server Admin (AppleShare IP Web administration)
+318 : "PKIX Time Stamp Protocol (TSP)",                                # TCP, UDP : PKIX Time Stamp Protocol (TSP)
+319 : "Precision Time Protocol (PTP) event messages",                  #    , UDP : Precision Time Protocol (PTP) event messages
+320 : "Precision Time Protocol (PTP) general messages",                #    , UDP : Precision Time Protocol (PTP) general messages
+350 : "Mapping of Airline Traffic over Internet Protocol type A",      # TCP, UDP : Mapping of Airline Traffic over Internet Protocol (MATIP) type A
+351 : "MATIP type B",                                                  # TCP, UDP : MATIP type B
+356 : "cloanto-net-1 (used by Cloanto Amiga Explorer and VMs)",        # TCP, UDP : cloanto-net-1 (used by Cloanto Amiga Explorer and VMs)
+366 : "On-Demand Mail Relay (ODMR)",                                   # TCP, UDP : On-Demand Mail Relay (ODMR)
+369 : "RPC 2 Port Mapper",                                             # TCP, UDP : RPC 2 Port Mapper
+370 : "Coda authentication server",                                    # TCP, UDP : Coda authentication server
+371 : "ClearCase albd",                                                # TCP, UDP : ClearCase albd
+383 : "HP data alarm manager",                                         # TCP, UDP : HP data alarm manager
+384 : "A Remote Network Server System",                                # TCP, UDP : A Remote Network Server System
+387 : "AURP, AppleTalk Update-based Routing Protocol",                 # TCP, UDP : AURP, AppleTalk Update-based Routing Protocol
+389 : "Lightweight Directory Access Protocol (LDAP)",                  # TCP, UDP : Lightweight Directory Access Protocol (LDAP)
+399 : "Digital Equipment Corporation DECnet (Phase V+) over TCP/IP",   # TCP, UDP : Digital Equipment Corporation DECnet (Phase V+) over TCP/IP
+401 : "Uninterruptible power supply (UPS)",                            # TCP, UDP : Uninterruptible power supply (UPS)
+427 : "Service Location Protocol (SLP)",                               # TCP, UDP : Service Location Protocol (SLP)
+433 : "NNSP, part of Network News Transfer Protocol",                  # TCP, UDP : NNSP, part of Network News Transfer Protocol
+434 : "Mobile IP Agent (RFC 5944)",                                    # TCP, UDP : Mobile IP Agent (RFC 5944)
+443 : "Hypertext Transfer Protocol over TLS/SSL (HTTPS)",              # TCP, UDP : Hypertext Transfer Protocol over TLS/SSL (HTTPS)
+444 : "Simple Network Paging Protocol (SNPP), RFC 1568",               # TCP, UDP : Simple Network Paging Protocol (SNPP), RFC 1568
+445 : "Microsoft-DS Active Directory, Windows shares",                 # TCP,     : Microsoft-DS Active Directory, Windows shares
+                                                                       # TCP,     : Microsoft-DS SMB file sharing
+464 : "Kerberos Change/Set password",                                  # TCP, UDP : Kerberos Change/Set password
+465 : "Message Submission over TLS protocol (SMTPS, RFC 8314)",        # TCP,     : URL Rendezvous Directory for SSM (Cisco protocol) / Message Submission over TLS protocol (SMTPS, RFC 8314)
+475 : "tcpnethaspsrv, Aladdin Knowledge Systems Hasp services",        # TCP, UDP : tcpnethaspsrv, Aladdin Knowledge Systems Hasp services
+491 : "GO-Global remote access and application publishing software",   # TCP, UDP : GO-Global remote access and application publishing software (go-login)
+497 : "Dantz Retrospect",                                              # TCP,     : Dantz Retrospect
+500 : "Internet Security Association and Key Management(ISAKMP)",      # TCP, UDP : Internet Security Association and Key Management Protocol (ISAKMP)
+502 : "Modbus Protocol",                                               # TCP, UDP : Modbus Protocol
+504 : "Citadel, multiservice protocol",                                # TCP, UDP : Citadel, multiservice protocol for dedicated clients for the Citadel groupware system
+510 : "FirstClass client/server groupware system",                     # TCP, UDP : FirstClass Protocol (FCP), used by FirstClass client/server groupware system
+512 : "Rexec, Remote Process Execution",                               # TCP,     : Rexec, Remote Process Execution
+                                                                       #    , UDP : comsat, together with biff
+513 : "rlogin",                                                        # TCP,     : rlogin
+                                                                       #    , UDP : who
+514 : "Remote Shell/syslog",                                           # TCP,     : Remote Shell, used to execute non-interactive commands on a remote system (Remote Shell, rsh, remsh)
+                                                                       #    , UDP : Syslog, used for system logging
+515 : "Line Printer Daemon (LPD), print service",                      # TCP,     : Line Printer Daemon (LPD), print service
+517 : "Talk",                                                          #    , UDP : Talk
+518 : "NTalk",                                                         #    , UDP : NTalk
+520 : "efs, extended file name server",                                # TCP,     : efs, extended file name server
+                                                                       #    , UDP : Routing Information Protocol (RIP)
+521 : "Routing Information Protocol Next Generation (RIPng)",          #    , UDP : Routing Information Protocol Next Generation (RIPng)
+524 : "NetWare Core Protocol (NCP)",                                   # TCP, UDP : 	NetWare Core Protocol (NCP) is used for a variety things such as access to primary NetWare server resources, Time Synchronization, etc.
+525 : "Timed, Timeserver",                                             #    , UDP : Timed, Timeserver
+530 : "Remote procedure call (RPC)",                                   # TCP, UDP : Remote procedure call (RPC)
+531 : "AOL Instant Messenger",                                         # TCP, UDP : AOL Instant Messenger
+532 : "netnews",                                                       # TCP,     : netnews
+533 : "netwall, For Emergency Broadcasts",                             #    , UDP : netwall, For Emergency Broadcasts
+540 : "Unix-to-Unix Copy Protocol (UUCP)",                             # TCP,     : Unix-to-Unix Copy Protocol (UUCP)
+542 : "commerce (Commerce Applications)",                              # TCP, UDP : commerce (Commerce Applications)
+543 : "klogin, Kerberos login",                                        # TCP,     : klogin, Kerberos login
+544 : "kshell, Kerberos Remote shell",                                 # TCP,     : kshell, Kerberos Remote shell
+545 : "OSIsoft PI (VMS), OSISoft PI Server Client Access",             # TCP,     : OSIsoft PI (VMS), OSISoft PI Server Client Access
+546 : "DHCPv6 client",                                                 # TCP, UDP : DHCPv6 client
+547 : "DHCPv6 server",                                                 # TCP, UDP : DHCPv6 server
+548 : "Apple Filing Protocol (AFP) over TCP",                          # TCP,     : Apple Filing Protocol (AFP) over TCP
+550 : "new-rwho, new-who",                                             # TCP, UDP : new-rwho, new-who
+554 : "Real Time Streaming Protocol (RTSP)",                           # TCP, UDP : Real Time Streaming Protocol (RTSP)
+556 : "Remotefs, RFS, rfs_server",                                     # TCP,     : Remotefs, RFS, rfs_server
+560 : "rmonitor, Remote Monitor",                                      #    , UDP : rmonitor, Remote Monitor
+561 : "monitor",                                                       #    , UDP : monitor
+563 : "NNTP over TLS/SSL (NNTPS)",                                     # TCP, UDP : NNTP over TLS/SSL (NNTPS)
+564 : "9P (Plan9)",                                                    # TCP,     : 9P (Plan9)
+587 : "e-mail message submission (SMTP)",                              # TCP,     : e-mail message submission (SMTP)
+591 : "FileMaker 6.0 (and later) Web Sharing",                         # TCP,     : FileMaker 6.0 (and later) Web Sharing
+593 : "Remote procedure call over Hypertext Transfer Protocol",        # TCP, UDP : HTTP RPC Ep Map, Remote procedure call over Hypertext Transfer Protocol, often used by Distributed Component Object Model services and Microsoft Exchange Server
+601 : "Reliable Syslog Service used for system logging",               # TCP,     : Reliable Syslog Service used for system logging
+604 : "TUNNEL profile",                                                # TCP,     : TUNNEL profile, a protocol for BEEP peers to form an application layer tunnel
+623 : "ASF Remote Management and Control Protocol (ASF-RMCP)",         #    , UDP : ASF Remote Management and Control Protocol (ASF-RMCP)
+625 : "Open Directory Proxy (ODProxy)",                                # TCP,     : Open Directory Proxy (ODProxy)
+631 : "Internet Printing Protocol",                                    # TCP, UDP : Internet Printing Protocol (IPP) / CUPS administration console (extension to IPP)
+635 : "RLZ DBase",                                                     # TCP, UDP : RLZ DBase
+636 : "Lightweight Directory Access Protocol over TLS/SSL (LDAPS)",    # TCP, UDP : Lightweight Directory Access Protocol over TLS/SSL (LDAPS)
+639 : "Multicast Source Discovery Protocol",                           # TCP, UDP : MSDP, Multicast Source Discovery Protocol
+641 : "SupportSoft Nexus Remote Command (control/listening)",                              # TCP, UDP : SupportSoft Nexus Remote Command (control/listening), a proxy gateway connecting remote control traffic
+643 : "SANity",                                                        # TCP, UDP : SANity
+646 : "Label Distribution Protocol in MPLS networks",                  # TCP, UDP : Label Distribution Protocol (LDP), a routing protocol used in MPLS networks
+647 : "DHCP Failover protocol",                                        # TCP,     : DHCP Failover protocol
+648 : "Registry Registrar Protocol (RRP)",                             # TCP,     : Registry Registrar Protocol (RRP)
+651 : "IEEE-MMS",                                                      # TCP, UDP : IEEE-MMS
+653 : "SupportSoft Nexus Remote Command (data)",                       # TCP, UDP : SupportSoft Nexus Remote Command (data), a proxy gateway connecting remote control traffic
+654 : "Media Management System (MMS) Media Management Protocol (MMP)", # TCP,     : Media Management System (MMS) Media Management Protocol (MMP)
+655 : "Tinc VPN daemon",                                               # TCP, UDP : Tinc VPN daemon
+657 : "IBM RMC protocol",                                              # TCP, UDP : IBM RMC (Remote monitoring and Control) protocol, used by System p5 AIX Integrated Virtualization Manager (IVM)[29] and Hardware Management Console to connect managed logical partitions (LPAR) to enable dynamic partition reconfiguration
+660 : "macOS Server administration",                                   # TCP,     : macOS Server administration
+666 : "Doom(game)",                                                    # TCP, UDP : Doom(game)
+                                                                       # TCP,     : airserv-ng, aircrack-ng's server for remote-controlling wireless devices
+674 : "Application Configuration Access Protocol (ACAP)",              # TCP,     : Application Configuration Access Protocol (ACAP)
+688 : "REALM-RUSD",                                                    # TCP, UDP : REALM-RUSD (ApplianceWare Server Appliance Management Protocol)
+690 : "Velneo Application Transfer Protocol (VATP)",                   # TCP, UDP : Velneo Application Transfer Protocol (VATP)
+691 : "MS Exchange Routing",                                           # TCP,     : MS Exchange Routing
+694 : "Linux-HA high-availability heartbeat",                          # TCP, UDP : Linux-HA high-availability heartbeat
+695 : "IEEE Media Management System over SSL (IEEE-MMS-SSL)",          # TCP,     : IEEE Media Management System over SSL (IEEE-MMS-SSL)
+698 : "Optimized Link State Routing (OLSR)",                           #    , UDP : Optimized Link State Routing (OLSR)
+700 : "Extensible Provisioning Protocol",                              # TCP,     : Extensible Provisioning Protocol (EPP), a protocol for communication between domain name registries and registrars (RFC 5734)
+701 : "Link Management Protocol",                                      # TCP,     : Link Management Protocol (LMP), a protocol that runs between a pair of nodes and is used to manage traffic engineering (TE) links
+702 : "Internet Registry Information Service over BEEP",               # TCP,     : IRIS (Internet Registry Information Service) over BEEP (Blocks Extensible Exchange Protocol) (RFC 3983)
+706 : "Secure Internet Live Conferencing (SILC)",                      # TCP,     : Secure Internet Live Conferencing (SILC)
+711 : "Cisco Tag Distribution Protocol",                               # TCP,     : Cisco Tag Distribution Protocol being replaced by the MPLS Label Distribution Protocol
+712 : "Topology Broadcast based on Reverse-Path Forwarding routing",   # TCP,     : Topology Broadcast based on Reverse-Path Forwarding routing protocol (TBRPF; RFC 3684)
+749 : "Kerberos administration",                                       # TCP, UDP : Kerberos administration
+750 : "kerberos-iv, Kerberos version IV",                              #    , UDP : kerberos-iv, Kerberos version IV
+751 : "kerberos_master, Kerberos authentication",                      # TCP, UDP : kerberos_master, Kerberos authentication
+752 : "passwd_server, Kerberos password (kpasswd) server",             #    , UDP : passwd_server, Kerberos password (kpasswd) server
+753 : "Reverse Routing Header (RRH)",                                  # TCP,     : Reverse Routing Header (RRH)
+                                                                       #    , UDP : Reverse Routing Header (RRH) / userreg_server, Kerberos userreg server
+754 : "tell send / krb5_prop, Kerberos v5 slave propagation",          # TCP,     : tell send / krb5_prop, Kerberos v5 slave propagation
+                                                                       #    , UDP : tell send
+760 : "krbupdate [kreg], Kerberos registration",                       # TCP, UDP : krbupdate [kreg], Kerberos registration
+782 : "Conserver serial-console management server",                    # TCP,     : Conserver serial-console management server
+783 : "SpamAssassin spamd daemon",                                     # TCP,     : SpamAssassin spamd daemon
+800 : "mdbe daemon",                                                   #    , UDP : mdbe daemon
+808 : "Microsoft Net.TCP Port Sharing Service",                        # TCP,     : Microsoft Net.TCP Port Sharing Service
+829 : "Certificate Management Protocol",                               # TCP,     : Certificate Management Protocol
+843 : "Adobe Flash",                                                   # TCP,     : Adobe Flash
+847 : "DHCP Failover protocol",                                        # TCP,     : DHCP Failover protocol
+848 : "Group Domain Of Interpretation (GDOI) protocol",                # TCP, UDP : Group Domain Of Interpretation (GDOI) protocol
+853 : "DNS over TLS",                                                  # TCP,     : DNS over TLS
+                                                                       #    , UDP : Group Domain Of Interpretation (GDOI) protocol
+860 : "iSCSI (RFC 3720)",                                              # TCP,     : iSCSI (RFC 3720)
+861 : "OWAMP control (RFC 4656)",                                      # TCP, UDP : OWAMP control (RFC 4656)
+862 : "TWAMP control (RFC 5357)",                                      # TCP, UDP : TWAMP control (RFC 5357)
+873 : "rsync file synchronization protocol",                           # TCP,     : rsync file synchronization protocol
+888 : "CD DataBase protocol",                                          # TCP,     : cddbp, CD DataBase (CDDB) protocol (CDDBP) / IBM Endpoint Manager Remote Control
+897 : "Brocade SMI-S RPC",                                             # TCP, UDP : Brocade SMI-S RPC
+898 : "Brocade SMI-S RPC SSL",                                         # TCP, UDP : Brocade SMI-S RPC SSL
+901 : "Samba Web Administration Tool (SWAT)",                          # TCP,     : Samba Web Administration Tool (SWAT)
+                                                                       # TCP, UDP : VMware Virtual Infrastructure Client (from managed device to management console)
+902 : "ideafarm-door  / VMware Server Console",                        # TCP, UDP : ideafarm-door (IdeaFarm (tm) Operations) / VMware Server Console (from management console to managed device)
+903 : "ideafarm-panic",                                                # TCP, UDP : ideafarm-panic (IdeaFarm (tm) Operations)
+                                                                       # TCP,     : VMware Remote Console
+904 : "VMware Server alternate",                                       # TCP,     : VMware Server alternate
+911 : "local tty redirection over OpenSSH",                            # TCP,     : Network Console on Acid (NCA), local tty redirection over OpenSSH
+944 : "Network File System Service (NFS)",                             #    , UDP : Network File System Service (NFS)
+953 : "Domain Name System (DNS) RNDC Service",                         # TCP, UDP : Domain Name System (DNS) RNDC Service
+973 : "Network File System over IPv6 Service",                         #    , UDP : Network File System over IPv6 Service
+981 : "SofaWare Technologies Remote HTTPS management for firewall",    # TCP,     : SofaWare Technologies Remote HTTPS management for firewall devices running embedded Check Point FireWall-1 software
+987 : "Microsoft Windows SBS SharePoint",                              # TCP,     : Microsoft Windows SBS SharePoint
+989 : "FTPS Protocol (data), FTP over TLS/SSL",                        # TCP, UDP : FTPS Protocol (data), FTP over TLS/SSL
+990 : "FTPS Protocol (control), FTP over TLS/SSL",                     # TCP, UDP : FTPS Protocol (control), FTP over TLS/SSL
+991 : "Netnews Administration System (NAS)",                           # TCP, UDP : Netnews Administration System (NAS)
+992 : "TELNET protocol over TLS/SSL",                                  # TCP, UDP : TELNET protocol over TLS/SSL
+993 : "Internet Message Access Protocol over TLS/SSL (IMAPS)",         # TCP,     : Internet Message Access Protocol over TLS/SSL (IMAPS)
+994 : "Internet Relay Chat over TLS/SSL (IRCS)",                       # TCP, UDP : Internet Relay Chat over TLS/SSL (IRCS)
+995 : "Post Office Protocol 3 over TLS/SSL (POP3S)",                   # TCP,     : Post Office Protocol 3 over TLS/SSL (POP3S)
+999 : "ScimoreDB Database System",                                     # TCP,     : ScimoreDB Database System
+1002 : "Opsware agent (aka cogbot)",                                   # TCP,     : Opsware agent (aka cogbot)
+1010 : "ThinLinc Web Administration",                                  # TCP,     : ThinLinc Web Administration
+}
+
+arpOpCodeList = {
+0 : "Reserved",                 # RFC5494
+1 : "ARP Request",              # RFC826, RFC5227
+2 : "ARP Reply",                # RFC826, RFC5227
+3 : "Reverse ARP Request",      # RFC903
+4 : "Reverse ARP Reply",        # RFC903
+5 : "DARP Request",             # RFC1931
+6 : "DARP Reply",               # RFC1931
+7 : "DARP Error",               # RFC1931
+8 : "Inverse ARP Request",      # RFC2390
+9 : "Inverse ARP Reply",        # RFC2390
+10 : "ARP NAK",                 # RFC1577
+11 : "MARS Request",            # Grenville Armitage
+12 : "MARS Multi",              # Grenville Armitage
+13 : "MARS MServ",              # Grenville Armitage
+14 : "MARS Join",               # Grenville Armitage
+15 : "MARS Leave",              # Grenville Armitage
+16 : "MARS NAK",                # Grenville Armitage
+17 : "MARS UnServ",             # Grenville Armitage
+18 : "MARS SJoin",              # Grenville Armitage
+19 : "MARS SLeave",             # Grenville Armitage
+20 : "MARS Group List Request", # Grenville Armitage
+21 : "MARS Group List Repaly",  # Grenville Armitage
+22 : "MARS Redirect Map",       # Grenville Armitage
+23 : "MARS MAP OS UN ARP",      # Mitsuru Maruyama; RFC 2176
+24 : "OP exp1",                 # RFC5494
+25 : "OP exp2",                 # RFC5494
+65535 : "Reserved 2",           # RFC5494
+}
+
+unknownProtocol = "Unknown Protocol"
+unknownPort = "Unknown Port"
+
+def print_packet_event(cpu,data,size):
+  global b, ethProtocolList, ipProtocolList, ipPortList, arpOpCodeList
+  event = b["packet_events"].event(data)
+
+  if event.eth_proto in ethProtocolList:
+    ethProtocolName = ethProtocolList[event.eth_proto]
+  else:
+    ethProtocolName = "unkown"
+  if event.ip_protocol in ipProtocolList:
+    ipProtocolName = ipProtocolList[event.ip_protocol]
+  else:
+    ipProtocolName = "unkown"
+  if event.port_source in ipPortList:
+    srcPortName = ipPortList[event.port_source]
+  else:
+    srcPortName = "unkown"
+  if event.port_dest in ipPortList:
+    destPortName = ipPortList[event.port_dest]
+  else:
+    destPortName = "unkown"
+  if event.arp_opcode in arpOpCodeList:
+    arpOpCodeName = arpOpCodeList[event.arp_opcode]
+  else:
+    arpOpCodeName = "unkown"
+
+  print("- EtherProtocol: %-4x # %s\n" % (event.eth_proto, ethProtocolName))
+  print("  EthSourceAddr: %-12lx # %-12lx\n" % (event.eth_source, event.eth_source))
+  print("  EthDestAddr: %-12lx # %-12lx\n" % (event.eth_dest, event.eth_dest))
+  print("  IpProtocol: %d # %s\n" % (event.ip_protocol, ipProtocolName))
+  print("  IpSourceAddr: %-8x # %-16s\n" % (event.v4_source, inet_ntop(AF_INET, pack("I",event.v4_source)).encode()))
+  print("  IpDestAddr: %-8x # %-16s\n" % (event.v4_dest, inet_ntop(AF_INET, pack("I",event.v4_dest)).encode()))
+  print("  IpSourcePort: %d # %s\n" % (event.port_source, srcPortName))
+  print("  IpDestPort: %d # %s\n" % (event.port_dest, destPortName))
+  print("  ArpOpcode: %d # %s\n" % (event.arp_opcode, arpOpCodeName))
+  print("  ArpSourceMac: %-12lx # %-12lx\n" % (event.arp_source_mac, event.arp_source_mac))
+  print("  ArpTargetMac: %-12lx # %-12lx\n" % (event.arp_target_mac, event.arp_target_mac))
+  print("  ArpSourceAddr: %-8x # %-16s\n" % (event.arp_source_ip, inet_ntop(AF_INET, pack("I",event.arp_source_ip)).encode()))
+  print("  ArpTargetAddr: %-8x # %-16s\n" % (event.arp_target_ip, inet_ntop(AF_INET, pack("I",event.arp_target_ip)).encode()))
+
+  #printb(b"%-5d %-2d %-12lx %-16s %-5d %-12lx %-16s %-5d %-5d %-16s %-16s %-12lx %-12lx" % (event.eth_proto, event.ip_protocol,
+  #  event.eth_source,
+  #  inet_ntop(AF_INET, pack("I",event.v4_source)).encode(),
+  #  event.port_source,
+  #  event.eth_dest,
+  #  inet_ntop(AF_INET, pack("I",event.v4_dest)).encode(),
+  #  event.port_dest,
+  #  event.arp_opcode,
+  #  inet_ntop(AF_INET, pack("I",event.arp_source_ip)).encode(),
+  #  inet_ntop(AF_INET, pack("I",event.arp_target_ip)).encode(),
+  #  event.arp_source_mac,
+  #  event.arp_target_mac
+  #))
+
+b = BPF(text=bpf_text)
+fn = b.load_func("packet_capture", BPF.XDP)
+
+#device = sys.argv[1]
+device = "enp0s3"
+
+b.attach_xdp(device, fn)
+
+b["packet_events"].open_perf_buffer(print_packet_event)
+
+while True:
+  try:
+    b.perf_buffer_poll()
+    #dropcnt.clear()
+    #time.sleep(1)
+    #for k, v in dropcnt.items():
+    #  print("{} {}: {} pkt/s".format(time.strftime("%H:%M:%S"), k.value, v.value))
+  except KeyboardInterrupt:
+    break
+
+b.remove_xdp(device)
+
