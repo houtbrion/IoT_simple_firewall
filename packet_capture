@@ -19,7 +19,7 @@ bpf_text = """
 #include <linux/udp.h>
 #include <linux/in.h>
 #include <linux/if_ether.h>
-//#include <linux/if_arp.h>
+#include <linux/if_arp.h>
 //#include <bpf/bpf_endian.h>
 //#include <bpf/bpf_helpers.h>
 
