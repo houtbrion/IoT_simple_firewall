@@ -20,7 +20,7 @@ bpf_text = """
 #include <linux/in.h>
 #include <linux/if_ether.h>
 //#include <linux/if_arp.h>
-#include <uapi/linux/if_arp.h>
+//#include <uapi/linux/if_arp.h>
 //#include <bpf/bpf_endian.h>
 //#include <bpf/bpf_helpers.h>
 
@@ -139,9 +139,12 @@ int packet_capture(struct xdp_md *ctx) {
         return XDP_PASS;
 
     // Validate: Ethernet hardware type, IPv4 protocol, correct lengths
-    if (arp->ar_hrd != bpf_htons(ARPHRD_ETHER) ||
+    /*if (arp->ar_hrd != bpf_htons(ARPHRD_ETHER) ||
         arp->ar_pro != bpf_htons(ETH_P_IP) ||
         arp->ar_hln != 6 ||
+        arp->ar_pln != 4)
+        return XDP_PASS;*/
+    if (arp->ar_hln != 6 ||
         arp->ar_pln != 4)
         return XDP_PASS;
 
