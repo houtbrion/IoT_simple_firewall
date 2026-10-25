@@ -27,15 +27,19 @@ b = BPF(text=bpf_text)
 #device = sys.argv[1]
 device = "enp0s3"
 
+interval = 10 # (sec)
+
 b.attach_xdp(device, fn = b.load_func("xdp_packet_count", BPF.XDP))
 dropcnt = b.get_table("dropcnt")
 while True:
   try:
     dropcnt.clear()
-    time.sleep(1)
+    time.sleep(interval)
     for k, v in dropcnt.items():
-      print("{} {}: {} pkt/s".format(time.strftime("%H:%M:%S"), k.value, v.value))
+      print("{} {}: {} pkt/s".format(time.strftime("%H:%M:%S"), k.value, (int(v.value)/interval)))
   except KeyboardInterrupt:
     break
 
 b.remove_xdp(device)
+
+

@@ -278,7 +278,7 @@ int packet_filter(struct xdp_md *ctx) {
     return XDP_DROP;
   }
 
-  if (check_mac == 2) { // MACのソースが見とれられたもの，宛先がサーバ以外の場合はARP以外は廃棄
+  if (check_mac == 2) { // 「MACのソースが認められたもの，かつ，宛先がサーバ以外」の場合はARP以外は廃棄
     if (event.eth_proto != ETH_P_ARP) {
       // アプリ層に通知を出してパケット廃棄
       packet_events.perf_submit(ctx, &event, sizeof(event));
