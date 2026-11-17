@@ -61,12 +61,16 @@ struct arphdr_eth_ipv4 {
 } __attribute__((packed));
 
 struct packet_event_t {
-  u16 eth_proto;
+  //u16 eth_proto;
+  u32 eth_proto;
   u64 eth_source, eth_dest;
-  u32 ip_protocol;
+  //u32 ip_protocol;
+  u32 protocol;
   u32 v4_source, v4_dest;
-  u16 port_source, port_dest;
-  u16 arp_opcode;
+  //u16 port_source, port_dest;
+  u32 port_source, port_dest;
+  //u16 arp_opcode;
+  u32 arp_opcode;
   u32 arp_source_ip, arp_target_ip;
   u64 arp_source_mac, arp_target_mac;
 };
@@ -75,7 +79,7 @@ struct packet_test_flags_t {
   u32 eth_protocol;
   u32 ip_protocol;
   u32 port;
-}
+};
 
 BPF_PERF_OUTPUT(packet_events);
 
@@ -91,13 +95,18 @@ int packet_filter(struct xdp_md *ctx) {
   struct packet_event_t event;
   event.eth_source = zero64;
   event.eth_dest = zero64;
-  event.eth_proto = zero16;
-  event.ip_protocol = zero32;
+  //event.eth_proto = zero16;
+  event.eth_proto = zero32;
+  //event.ip_protocol = zero32;
+  event.protocol = zero32;
   event.v4_source = zero32;
   event.v4_dest = zero32;
-  event.port_source = zero16;
-  event.port_dest = zero16;
-  event.arp_opcode = zero16;
+  //event.port_source = zero16;
+  event.port_source = zero32;
+  //event.port_dest = zero16;
+  event.port_dest = zero32;
+  //event.arp_opcode = zero16;
+  event.arp_opcode = zero32;
   event.arp_source_ip = zero32;
   event.arp_target_ip = zero32;
   event.arp_source_mac = zero64;
@@ -152,7 +161,8 @@ int packet_filter(struct xdp_md *ctx) {
     if ((void*)&iph[1] > data_end)
       return XDP_PASS;
 
-    event.ip_protocol = iph->protocol;
+    //event.ip_protocol = iph->protocol;
+    event.protocol = iph->protocol;
     event.v4_source = iph->saddr;
     event.v4_dest = iph->daddr;
 
@@ -161,7 +171,8 @@ int packet_filter(struct xdp_md *ctx) {
       return XDP_PASS;
     }
 
-    if (event.ip_protocol == IPPROTO_TCP) {
+    //if (event.ip_protocol == IPPROTO_TCP) {
+    if (event.protocol == IPPROTO_TCP) {
       struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
       if ((void *)(tcp +1) > data_end) {
         return XDP_PASS;
@@ -172,7 +183,8 @@ int packet_filter(struct xdp_md *ctx) {
       }
       event.port_source = ntohs(tcp->source);
       event.port_dest = ntohs(tcp->dest);
-    } else if (event.ip_protocol == IPPROTO_UDP) {
+    //} else if (event.ip_protocol == IPPROTO_UDP) {
+    } else if (event.protocol == IPPROTO_UDP) {
       struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
       if ((void *)(udp +1) > data_end) {
         return XDP_PASS;
@@ -253,7 +265,7 @@ int packet_filter(struct xdp_md *ctx) {
       }
     }
     // MACのソースアドレスが認められた端末か否かを確認
-    val = allowMacRuleMap.lookup_or_init(&eth_source, &zero32);
+    val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
       if ((*val) == ENABLE) {
         // MACの宛先がサーバ類ならOKとする
@@ -289,6 +301,8 @@ int packet_filter(struct xdp_md *ctx) {
   }
 
   u32 *eth_protocol_val;
+  //u16 *eth_protocol_val;
+  //eth_protocol_val = allowArpOpCode.lookup_or_init(&event.eth_proto, &zero16);
   eth_protocol_val = allowArpOpCode.lookup_or_init(&event.eth_proto, &zero32);
   if (eth_protocol_val) {
     if ((*eth_protocol_val) != ENABLE) {
@@ -313,6 +327,7 @@ int packet_filter(struct xdp_md *ctx) {
             goto packet_pass;
           }
           u32 *port_val;
+          //u16 *port_val;
           port_val = allowPortListTCP.lookup_or_init(&event.port_dest, &zero32);
           if (port_val) {
             if ((*port_val) == ENABLE) {
@@ -341,7 +356,7 @@ int packet_filter(struct xdp_md *ctx) {
         }
       }
     }
-  } else (event.eth_proto == ETH_P_ARP) {
+  } else if (event.eth_proto == ETH_P_ARP) {
     if (test_flags.ip_protocol != ENABLE) {
       return XDP_PASS;
     }
