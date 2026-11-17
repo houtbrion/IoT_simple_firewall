@@ -646,7 +646,9 @@ b = BPF(text=bpf_text)
 fn = b.load_func("packet_capture", BPF.XDP)
 
 #device = sys.argv[1]
-device = "enp0s3"
+#device = "enp0s3"
+#device = "br0"
+device = "wlan0"
 
 b.attach_xdp(device, fn)
 

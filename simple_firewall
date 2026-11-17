@@ -190,9 +190,7 @@ int packet_filter(struct xdp_md *ctx) {
         return XDP_PASS;
 
     // Validate: Ethernet hardware type, IPv4 protocol, correct lengths
-    if (arp->ar_hrd != bpf_htons(ARPHRD_ETHER) ||
-        arp->ar_pro != bpf_htons(ETH_P_IP) ||
-        arp->ar_hln != 6 ||
+    if (arp->ar_hln != 6 ||
         arp->ar_pln != 4)
         return XDP_PASS;
 
@@ -378,9 +376,15 @@ def print_packet_event(cpu,data,size):
     event.port_dest))
 
 
-serverMacList = [0x80027157b59]
+serverMacList = [
+  0x80027157b59,
+  0x08002728ab7e
+]
 
 allowMAC = [
+  0xcc96e5b8d450,
+  0xf412fa6e956c,
+  0x70041dd29434,
   0xcc96e5b8d450
 ]
 
@@ -1067,7 +1071,9 @@ b = BPF(text=bpf_text)
 fn = b.load_func("packet_filter", BPF.XDP)
 
 #device = sys.argv[1]
-device = "enp0s3"
+#device = "enp0s3"
+#device = "br0"
+device = "wlan0"
 
 b.attach_xdp(device, fn)
 

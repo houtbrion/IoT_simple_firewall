@@ -25,7 +25,9 @@ int xdp_packet_count(struct xdp_md *ctx) {
 b = BPF(text=bpf_text)
 
 #device = sys.argv[1]
-device = "enp0s3"
+#device = "enp0s3"
+#device = "br0"
+device = "wlan0"
 
 interval = 10 # (sec)
 

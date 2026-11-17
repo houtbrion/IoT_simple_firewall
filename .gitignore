@@ -86,3 +86,8 @@ example
 config.h
 config.yaml
 test*
+
+
+# working directories
+実験用/
+work/
