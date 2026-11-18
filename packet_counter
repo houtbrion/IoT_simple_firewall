@@ -9,13 +9,13 @@ bpf_text = """
 #include <uapi/linux/bpf.h>
 #include <linux/ip.h>
 
-BPF_HASH(dropcnt, u32, u32);
+BPF_HASH(packetcnt, u32, u32);
 
 int xdp_packet_count(struct xdp_md *ctx) {
 
   u32 value = 0, protocol=0, *vp;
 
-  vp = dropcnt.lookup_or_init(&protocol, &value);
+  vp = packetcnt.lookup_or_init(&protocol, &value);
   *vp += 1;
 
   return XDP_PASS;
@@ -32,12 +32,12 @@ device = "wlan0"
 interval = 10 # (sec)
 
 b.attach_xdp(device, fn = b.load_func("xdp_packet_count", BPF.XDP))
-dropcnt = b.get_table("dropcnt")
+packetcnt = b.get_table("packetcnt")
 while True:
   try:
-    dropcnt.clear()
+    packetcnt.clear()
     time.sleep(interval)
-    for k, v in dropcnt.items():
+    for k, v in packetcnt.items():
       print("{} {}: {} pkt/s".format(time.strftime("%H:%M:%S"), k.value, (int(v.value)/interval)))
   except KeyboardInterrupt:
     break
