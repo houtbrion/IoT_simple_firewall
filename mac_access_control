@@ -237,10 +237,10 @@ int packet_filter(struct xdp_md *ctx) {
     val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
       if ((*val) != ENABLE) {
-        check_mac = 1; # 宛先がブロードキャストで、MACのソースが認められたものではない場合
+        check_mac = 1; // 宛先がブロードキャストで、MACのソースが認められたものではない場合
       }
     } else {
-      check_mac = 1; # 宛先がブロードキャストで、MACのソースが認められたものではない場合
+      check_mac = 1; // 宛先がブロードキャストで、MACのソースが認められたものではない場合
     }
   } else if ((event.eth_dest & MAC_MULTICAST_MASK) > 0) { // マルチキャストの場合
     // MACのソースがサーバ等の装置なら通す
@@ -256,10 +256,10 @@ int packet_filter(struct xdp_md *ctx) {
     val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
       if ((*val) != ENABLE) {
-        check_mac = 2; # 宛先がマルチキャストで、MACのソースが認められたものではない場合
+        check_mac = 2; // 宛先がマルチキャストで、MACのソースが認められたものではない場合
       }
     } else {
-      check_mac = 2; # 宛先がマルチキャストで、MACのソースが認められたものではない場合
+      check_mac = 2; // 宛先がマルチキャストで、MACのソースが認められたものではない場合
     }
   } else { // ユニキャストの場合
     // MACのソースがサーバ等の装置なら通す
@@ -280,16 +280,16 @@ int packet_filter(struct xdp_md *ctx) {
         val = serverMAC.lookup_or_init(&eth_dest, &zero32);
         if (val) {
           if ((*val) != ENABLE) {
-            check_mac = 3; # ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
+            check_mac = 3; // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
           }
         } else {
-          check_mac = 3; # ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
+          check_mac = 3; // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
         }
       } else {
-        check_mac = 4; # ユニキャストパケットで，発信元が認められていない端末の場合
+        check_mac = 4; // ユニキャストパケットで，発信元が認められていない端末の場合
       }
     } else {
-      check_mac = 4; # ユニキャストパケットで，発信元が認められていない端末の場合
+      check_mac = 4; // ユニキャストパケットで，発信元が認められていない端末の場合
     }
   }
   event.drop_reason = check_mac;
