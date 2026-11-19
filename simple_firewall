@@ -93,6 +93,8 @@ int packet_filter(struct xdp_md *ctx) {
   u64 nh_off = sizeof(*eth);
   u64 eth_source, eth_dest;
   struct packet_event_t event;
+  eth_source = zero64;
+  eth_dest = zero64;
   event.eth_source = zero64;
   event.eth_dest = zero64;
   //event.eth_proto = zero16;
@@ -392,9 +394,10 @@ def print_packet_event(cpu,data,size):
 
 
 serverMacList = [
-  0x80027157b59,
-  0x08002728ab7e,
-  0xb827ebbce014
+  0x080027157b59,
+  0x08002728ab7e, # VM NetService
+  0xb827ebbce014, # Raspberry Pi wifi
+  0x00e5f1038318  # Baffalo wifi
 ]
 
 allowMAC = [
