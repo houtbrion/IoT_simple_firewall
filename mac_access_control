@@ -26,7 +26,6 @@ bpf_text = """
 #define MAX_TCP_HEADER_BYTES 60
 
 #define MAC_BROADCAST    0xFFFFFFFFFFFF
-//#define MAC_MULTICAST_MASK 0x800000000000
 #define MAC_MULTICAST_MASK 0x010000000000
 
 #define ENABLE 1
@@ -62,15 +61,11 @@ struct arphdr_eth_ipv4 {
 } __attribute__((packed));
 
 struct packet_event_t {
-  //u16 eth_proto;
   u32 eth_proto;
   u64 eth_source, eth_dest;
-  //u32 ip_protocol;
   u32 protocol;
   u32 v4_source, v4_dest;
-  //u16 port_source, port_dest;
   u32 port_source, port_dest;
-  //u16 arp_opcode;
   u32 arp_opcode;
   u32 arp_source_ip, arp_target_ip;
   u64 arp_source_mac, arp_target_mac;
@@ -97,17 +92,12 @@ int packet_filter(struct xdp_md *ctx) {
   struct packet_event_t event;
   event.eth_source = zero64;
   event.eth_dest = zero64;
-  //event.eth_proto = zero16;
   event.eth_proto = zero32;
-  //event.ip_protocol = zero32;
   event.protocol = zero32;
   event.v4_source = zero32;
   event.v4_dest = zero32;
-  //event.port_source = zero16;
   event.port_source = zero32;
-  //event.port_dest = zero16;
   event.port_dest = zero32;
-  //event.arp_opcode = zero16;
   event.arp_opcode = zero32;
   event.arp_source_ip = zero32;
   event.arp_target_ip = zero32;
@@ -165,7 +155,6 @@ int packet_filter(struct xdp_md *ctx) {
     if ((void*)&iph[1] > data_end)
       return XDP_PASS;
 
-    //event.ip_protocol = iph->protocol;
     event.protocol = iph->protocol;
     event.v4_source = iph->saddr;
     event.v4_dest = iph->daddr;
@@ -175,7 +164,6 @@ int packet_filter(struct xdp_md *ctx) {
       return XDP_PASS;
     }
 
-    //if (event.ip_protocol == IPPROTO_TCP) {
     if (event.protocol == IPPROTO_TCP) {
       struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
       if ((void *)(tcp +1) > data_end) {
@@ -187,7 +175,6 @@ int packet_filter(struct xdp_md *ctx) {
       }
       event.port_source = ntohs(tcp->source);
       event.port_dest = ntohs(tcp->dest);
-    //} else if (event.ip_protocol == IPPROTO_UDP) {
     } else if (event.protocol == IPPROTO_UDP) {
       struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
       if ((void *)(udp +1) > data_end) {
