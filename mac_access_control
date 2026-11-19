@@ -386,7 +386,9 @@ packet_drop:
 def print_packet_event(cpu,data,size):
   global b
   event = b["packet_events"].event(data)
-  printb(b"%-2d %-12lx %-16s %-5d %-12lx %-16s %-5d" % (event.protocol,
+  printb(b"%-4d %-2d %-12lx %-16s %-5d %-12lx %-16s %-5d" % (
+    event.drop_reason,
+    event.protocol,
     event.eth_source,
     inet_ntop(AF_INET, pack("I",event.v4_source)).encode(),
     event.port_source,
