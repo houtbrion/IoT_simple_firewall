@@ -386,16 +386,21 @@ packet_drop:
 def print_packet_event(cpu,data,size):
   global b
   event = b["packet_events"].event(data)
-  printb(b"%-4d %-2d %-12lx %-16s %-5d %-12lx %-16s %-5d" % (
+  printb(b"%-4d %-4d %-2d %-12lx %-16s %-5d %-12lx %-16s %-5d %-4d %-16s %-16s %-12lx %-12lx" % (
     event.drop_reason,
+    event.eth_proto,
     event.protocol,
     event.eth_source,
     inet_ntop(AF_INET, pack("I",event.v4_source)).encode(),
     event.port_source,
     event.eth_dest,
     inet_ntop(AF_INET, pack("I",event.v4_dest)).encode(),
-    event.port_dest))
-
+    event.port_dest,
+    event.arp_opcode,
+    inet_ntop(AF_INET, pack("I",event.arp_source_ip)).encode(),
+    inet_ntop(AF_INET, pack("I",event.arp_target_ip)).encode(),
+    event.arp_source_mac,
+    event.arp_target_mac))
 
 serverMacList = [
   0x080027157b59,
