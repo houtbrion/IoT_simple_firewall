@@ -94,8 +94,6 @@ int packet_filter(struct xdp_md *ctx) {
   u64 nh_off = sizeof(*eth);
   u64 eth_source, eth_dest;
   struct packet_event_t event;
-  eth_source = zero64;
-  eth_dest = zero64;
   event.eth_source = zero64;
   event.eth_dest = zero64;
   //event.eth_proto = zero16;
@@ -147,6 +145,8 @@ int packet_filter(struct xdp_md *ctx) {
   if (data + nh_off > data_end)
     return XDP_PASS;
 
+  eth_source = zero64;
+  eth_dest = zero64;
   for (int i=0; i< ETH_ALEN ; i++) {
     eth_source = eth_source << 8;
     eth_dest = eth_dest << 8;
@@ -155,8 +155,8 @@ int packet_filter(struct xdp_md *ctx) {
   }
   event.eth_source = eth_source;
   event.eth_dest = eth_dest;
-  eth_source = 0;
-  eth_dest = 0;
+  eth_source = zero64;
+  eth_dest = zero64;
   event.eth_proto = htons(eth->h_proto);
 
   if (event.eth_proto == ETH_P_IP) {
@@ -236,9 +236,11 @@ int packet_filter(struct xdp_md *ctx) {
     // MACのソースアドレスが認められた端末か否かを確認
     val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
-      if ((*val) == ENABLE) {
-        check_mac = 1;
+      if ((*val) != ENABLE) {
+        check_mac = 1; # 宛先がブロードキャストで、MACのソースが認められたものではない場合
       }
+    } else {
+      check_mac = 1; # 宛先がブロードキャストで、MACのソースが認められたものではない場合
     }
   } else if ((event.eth_dest & MAC_MULTICAST_MASK) > 0) { // マルチキャストの場合
     // MACのソースがサーバ等の装置なら通す
@@ -253,9 +255,11 @@ int packet_filter(struct xdp_md *ctx) {
     // MACのソースアドレスが認められた端末か否かを確認
     val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
-      if ((*val) == ENABLE) {
-        check_mac = 1;
+      if ((*val) != ENABLE) {
+        check_mac = 2; # 宛先がマルチキャストで、MACのソースが認められたものではない場合
       }
+    } else {
+      check_mac = 2; # 宛先がマルチキャストで、MACのソースが認められたものではない場合
     }
   } else { // ユニキャストの場合
     // MACのソースがサーバ等の装置なら通す
@@ -275,23 +279,28 @@ int packet_filter(struct xdp_md *ctx) {
         eth_dest = event.eth_dest;
         val = serverMAC.lookup_or_init(&eth_dest, &zero32);
         if (val) {
-          if ((*val) == ENABLE) {
-            check_mac = 1;
+          if ((*val) != ENABLE) {
+            check_mac = 3; # ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
           }
         } else {
-          check_mac = 2;
+          check_mac = 3; # ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
         }
+      } else {
+        check_mac = 4; # ユニキャストパケットで，発信元が認められていない端末の場合
       }
+    } else {
+      check_mac = 4; # ユニキャストパケットで，発信元が認められていない端末の場合
     }
   }
   event.drop_reason = check_mac;
 
-  if (check_mac ==0) { // MACチェックの結果が否の場合
+  if (check_mac !=0) { // MACチェックの結果が否の場合
     // アプリ層に通知を出してパケット廃棄
     packet_events.perf_submit(ctx, &event, sizeof(event));
     return XDP_DROP;
   }
 
+/*
   if (check_mac == 2) { // 「MACのソースが認められたもの，かつ，宛先がサーバ以外」の場合はARP以外は廃棄
     if (event.eth_proto != ETH_P_ARP) {
       // アプリ層に通知を出してパケット廃棄
@@ -299,6 +308,7 @@ int packet_filter(struct xdp_md *ctx) {
       return XDP_DROP;
     }
   }
+*/
 
   return XDP_PASS;
 
