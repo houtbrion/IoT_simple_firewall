@@ -282,7 +282,14 @@ int packet_filter(struct xdp_md *ctx) {
   }
   event.drop_reason = check_mac;
 
-  if (check_mac !=0) { // MACチェックの結果が否の場合
+
+  if (check_mac == 3) { // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
+    if (event.eth_proto != ETH_P_ARP) {
+      // アプリ層に通知を出してパケット廃棄
+      packet_events.perf_submit(ctx, &event, sizeof(event));
+      return XDP_DROP;
+    }
+  } else if (check_mac !=0) { // MACチェックの結果が否の場合
     // アプリ層に通知を出してパケット廃棄
     packet_events.perf_submit(ctx, &event, sizeof(event));
     return XDP_DROP;
@@ -372,7 +379,6 @@ int packet_filter(struct xdp_md *ctx) {
       goto packet_drop;
     }
   }
-
 
 packet_pass:
   return XDP_PASS;
