@@ -393,7 +393,8 @@ def print_packet_event(cpu,data,size):
 
 serverMacList = [
   0x80027157b59,
-  0x08002728ab7e
+  0x08002728ab7e,
+  0xb827ebbce014
 ]
 
 allowMAC = [
