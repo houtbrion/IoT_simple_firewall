@@ -305,7 +305,7 @@ int packet_filter(struct xdp_md *ctx) {
 
   // 発信元のMACが認められたパケットの場合のプロトコルレベルのチェック
   u32 *eth_protocol_val;
-  eth_protocol_val = allowArpOpCode.lookup_or_init(&event.eth_proto, &zero32);
+  eth_protocol_val = allowEthProtocolList.lookup_or_init(&event.eth_proto, &zero32);
   if (eth_protocol_val) {
     if ((*eth_protocol_val) != ENABLE) {
       event.check_result = 11; // 許可されていないEthernetプロトコル
