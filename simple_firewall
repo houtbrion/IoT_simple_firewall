@@ -811,6 +811,7 @@ allowPortListTCP = [
 999,  # TCP,     : ScimoreDB Database System
 1002, # TCP,     : Opsware agent (aka cogbot)
 1010, # TCP,     : ThinLinc Web Administration
+1883, # TCP, UDP : Message Queuing Telemetry Transport (MQTT)
 ]
 
 allowPortListUDP = [
@@ -1060,6 +1061,7 @@ allowPortListUDP = [
 999,  # TCP,     : ScimoreDB Database System
 1002, # TCP,     : Opsware agent (aka cogbot)
 1010, # TCP,     : ThinLinc Web Administration
+1883, # TCP, UDP : Message Queuing Telemetry Transport (MQTT)
 ]
 
 allowArpOpCode = [
