@@ -208,7 +208,7 @@ int packet_filter(struct xdp_md *ctx) {
     }
   }
 
-  u8 check_mac =0;
+  u32 check_mac =0;
 
   // 宛先MACアドレスの種類による区別
   if (event.eth_dest == MAC_BROADCAST) { // ブロードキャストの場合
