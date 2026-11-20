@@ -26,7 +26,7 @@ bpf_text = """
 #define MAX_TCP_HEADER_BYTES 60
 
 #define MAC_BROADCAST    0xFFFFFFFFFFFF
-#define MAC_MULTICAST_MASK 0x800000000000
+#define MAC_MULTICAST_MASK 0x010000000000
 
 #define ENABLE 1
 #define DISABLE 0
@@ -61,18 +61,15 @@ struct arphdr_eth_ipv4 {
 } __attribute__((packed));
 
 struct packet_event_t {
-  //u16 eth_proto;
   u32 eth_proto;
   u64 eth_source, eth_dest;
-  //u32 ip_protocol;
   u32 protocol;
   u32 v4_source, v4_dest;
-  //u16 port_source, port_dest;
   u32 port_source, port_dest;
-  //u16 arp_opcode;
   u32 arp_opcode;
   u32 arp_source_ip, arp_target_ip;
   u64 arp_source_mac, arp_target_mac;
+  u32 check_result;
 };
 
 struct packet_test_flags_t {
@@ -93,21 +90,14 @@ int packet_filter(struct xdp_md *ctx) {
   u64 nh_off = sizeof(*eth);
   u64 eth_source, eth_dest;
   struct packet_event_t event;
-  eth_source = zero64;
-  eth_dest = zero64;
   event.eth_source = zero64;
   event.eth_dest = zero64;
-  //event.eth_proto = zero16;
   event.eth_proto = zero32;
-  //event.ip_protocol = zero32;
   event.protocol = zero32;
   event.v4_source = zero32;
   event.v4_dest = zero32;
-  //event.port_source = zero16;
   event.port_source = zero32;
-  //event.port_dest = zero16;
   event.port_dest = zero32;
-  //event.arp_opcode = zero16;
   event.arp_opcode = zero32;
   event.arp_source_ip = zero32;
   event.arp_target_ip = zero32;
@@ -146,6 +136,8 @@ int packet_filter(struct xdp_md *ctx) {
   if (data + nh_off > data_end)
     return XDP_PASS;
 
+  eth_source = zero64;
+  eth_dest = zero64;
   for (int i=0; i< ETH_ALEN ; i++) {
     eth_source = eth_source << 8;
     eth_dest = eth_dest << 8;
@@ -154,8 +146,8 @@ int packet_filter(struct xdp_md *ctx) {
   }
   event.eth_source = eth_source;
   event.eth_dest = eth_dest;
-  eth_source = 0;
-  eth_dest = 0;
+  eth_source = zero64;
+  eth_dest = zero64;
   event.eth_proto = htons(eth->h_proto);
 
   if (event.eth_proto == ETH_P_IP) {
@@ -163,7 +155,6 @@ int packet_filter(struct xdp_md *ctx) {
     if ((void*)&iph[1] > data_end)
       return XDP_PASS;
 
-    //event.ip_protocol = iph->protocol;
     event.protocol = iph->protocol;
     event.v4_source = iph->saddr;
     event.v4_dest = iph->daddr;
@@ -173,7 +164,6 @@ int packet_filter(struct xdp_md *ctx) {
       return XDP_PASS;
     }
 
-    //if (event.ip_protocol == IPPROTO_TCP) {
     if (event.protocol == IPPROTO_TCP) {
       struct tcphdr *tcp = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
       if ((void *)(tcp +1) > data_end) {
@@ -185,7 +175,6 @@ int packet_filter(struct xdp_md *ctx) {
       }
       event.port_source = ntohs(tcp->source);
       event.port_dest = ntohs(tcp->dest);
-    //} else if (event.ip_protocol == IPPROTO_UDP) {
     } else if (event.protocol == IPPROTO_UDP) {
       struct udphdr *udp = (struct udphdr *)((unsigned char *)iph + ip_hdr_len);
       if ((void *)(udp +1) > data_end) {
@@ -235,10 +224,13 @@ int packet_filter(struct xdp_md *ctx) {
     // MACのソースアドレスが認められた端末か否かを確認
     val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
-      if ((*val) == ENABLE) {
-        check_mac = 1;
+      if ((*val) != ENABLE) {
+        check_mac = 1; // 宛先がブロードキャストで、MACのソースが認められたものではない場合
       }
+    } else {
+      check_mac = 1; // 宛先がブロードキャストで、MACのソースが認められたものではない場合
     }
+    check_mac = 1001; // 宛先がブロードキャストでMACのソースが認められたものの場合
   } else if ((event.eth_dest & MAC_MULTICAST_MASK) > 0) { // マルチキャストの場合
     // MACのソースがサーバ等の装置なら通す
     eth_source = event.eth_source;
@@ -252,10 +244,13 @@ int packet_filter(struct xdp_md *ctx) {
     // MACのソースアドレスが認められた端末か否かを確認
     val = allowMAC.lookup_or_init(&eth_source, &zero32);
     if (val) {
-      if ((*val) == ENABLE) {
-        check_mac = 1;
+      if ((*val) != ENABLE) {
+        check_mac = 2; // 宛先がマルチキャストで、MACのソースが認められたものではない場合
       }
+    } else {
+      check_mac = 2; // 宛先がマルチキャストで、MACのソースが認められたものではない場合
     }
+    check_mac = 1002; // 宛先がマルチキャストでMACのソースが認められたものの場合
   } else { // ユニキャストの場合
     // MACのソースがサーバ等の装置なら通す
     eth_source = event.eth_source;
@@ -274,54 +269,62 @@ int packet_filter(struct xdp_md *ctx) {
         eth_dest = event.eth_dest;
         val = serverMAC.lookup_or_init(&eth_dest, &zero32);
         if (val) {
-          if ((*val) == ENABLE) {
-            check_mac = 1;
+          if ((*val) != ENABLE) {
+            check_mac = 3; // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
           }
         } else {
-          check_mac = 2;
+          check_mac = 3; // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
         }
+      } else {
+        check_mac = 4; // ユニキャストパケットで，発信元が認められていない端末の場合
       }
+    } else {
+      check_mac = 4; // ユニキャストパケットで，発信元が認められていない端末の場合
     }
+    check_mac = 1003; // 宛先がユニキャストでMACのソースが認められたものの場合
   }
+  event.check_result = check_mac;
 
-  if (check_mac ==0) { // MACチェックの結果が否の場合
+  // プロトコルレベルのチェック
+  if (check_mac == 3) { // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
+    if (event.eth_proto != ETH_P_ARP) {  // ARP以外は廃棄
+      // アプリ層に通知を出してパケット廃棄
+      packet_events.perf_submit(ctx, &event, sizeof(event));
+      return XDP_DROP;
+    }
+  } else if (check_mac <1000) { // MACチェックの結果が否の場合
     // アプリ層に通知を出してパケット廃棄
     packet_events.perf_submit(ctx, &event, sizeof(event));
     return XDP_DROP;
   }
 
-  if (check_mac == 2) { // 「MACのソースが認められたもの，かつ，宛先がサーバ以外」の場合はARP以外は廃棄
-    if (event.eth_proto != ETH_P_ARP) {
-      // アプリ層に通知を出してパケット廃棄
-      packet_events.perf_submit(ctx, &event, sizeof(event));
-      return XDP_DROP;
-    }
-  }
-
+  // MACレベルのプロトコルチェックが不要な場合はパケットは通す
   if (test_flags.eth_protocol != ENABLE) {
     return XDP_PASS;
   }
 
+  // 発信元のMACが認められたパケットの場合のプロトコルレベルのチェック
   u32 *eth_protocol_val;
-  //u16 *eth_protocol_val;
-  //eth_protocol_val = allowArpOpCode.lookup_or_init(&event.eth_proto, &zero16);
   eth_protocol_val = allowArpOpCode.lookup_or_init(&event.eth_proto, &zero32);
   if (eth_protocol_val) {
     if ((*eth_protocol_val) != ENABLE) {
+      event.check_result = 11; // 許可されていないEthernetプロトコル
       goto packet_drop;
     }
   } else {
+    event.check_result = 11; // 許可されていないEthernetプロトコル
     goto packet_drop;
   }
 
   if (event.eth_proto == ETH_P_IP) {
-    if (test_flags.ip_protocol != ENABLE) {
+    if (test_flags.ip_protocol != ENABLE) {  // IPレベルのプロトコルチェックが不要な場合はパケットは通す
       return XDP_PASS;
     }
     u32 *protocol_val;
     protocol_val = allowIpProtocolList.lookup_or_init(&event.protocol, &zero32);
     if (protocol_val) {
       if ((*protocol_val) != ENABLE) {
+        event.check_result = 101; // 許可されていないIPプロトコル
         goto packet_drop;
       } else {
         if (event.protocol == IPPROTO_TCP) {
@@ -329,15 +332,16 @@ int packet_filter(struct xdp_md *ctx) {
             goto packet_pass;
           }
           u32 *port_val;
-          //u16 *port_val;
           port_val = allowPortListTCP.lookup_or_init(&event.port_dest, &zero32);
           if (port_val) {
             if ((*port_val) == ENABLE) {
               goto packet_pass;
             } else {
+              event.check_result = 201; // 許可されていないTCPポート
               goto packet_drop;
             }
           } else {
+            event.check_result = 201; // 許可されていないTCPポート
             goto packet_drop;
           }
         } else if (event.protocol == IPPROTO_UDP) {
@@ -350,9 +354,11 @@ int packet_filter(struct xdp_md *ctx) {
             if ((*port_val) == ENABLE) {
               goto packet_pass;
             } else {
+              event.check_result = 301; // 許可されていないUDPポート
               goto packet_drop;
             }
           } else {
+            event.check_result = 301; // 許可されていないUDPポート
             goto packet_drop;
           }
         }
@@ -367,10 +373,10 @@ int packet_filter(struct xdp_md *ctx) {
     if ((*arp_opcode_val) == ENABLE) {
       goto packet_pass;
     } else {
+      event.check_result = 401; // 許可されていないARPオペコード
       goto packet_drop;
     }
   }
-
 
 packet_pass:
   return XDP_PASS;
@@ -384,14 +390,21 @@ packet_drop:
 def print_packet_event(cpu,data,size):
   global b
   event = b["packet_events"].event(data)
-  printb(b"%-2d %-12lx %-16s %-5d %-12lx %-16s %-5d" % (event.protocol,
+  printb(b"%-4d %-4d %-2d %-12lx %-16s %-5d %-12lx %-16s %-5d %-4d %-16s %-16s %-12lx %-12lx" % (
+    event.check_result,
+    event.eth_proto,
+    event.protocol,
     event.eth_source,
     inet_ntop(AF_INET, pack("I",event.v4_source)).encode(),
     event.port_source,
     event.eth_dest,
     inet_ntop(AF_INET, pack("I",event.v4_dest)).encode(),
-    event.port_dest))
-
+    event.port_dest,
+    event.arp_opcode,
+    inet_ntop(AF_INET, pack("I",event.arp_source_ip)).encode(),
+    inet_ntop(AF_INET, pack("I",event.arp_target_ip)).encode(),
+    event.arp_source_mac,
+    event.arp_target_mac))
 
 serverMacList = [
   0x080027157b59,
