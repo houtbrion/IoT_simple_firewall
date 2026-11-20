@@ -69,7 +69,7 @@ struct packet_event_t {
   u32 arp_opcode;
   u32 arp_source_ip, arp_target_ip;
   u64 arp_source_mac, arp_target_mac;
-  u32 drop_reason;
+  u32 check_result;
 };
 
 struct packet_test_flags_t {
@@ -280,11 +280,11 @@ int packet_filter(struct xdp_md *ctx) {
       check_mac = 4; // ユニキャストパケットで，発信元が認められていない端末の場合
     }
   }
-  event.drop_reason = check_mac;
+  event.check_result = check_mac;
 
 
   if (check_mac == 3) { // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
-    if (event.eth_proto != ETH_P_ARP) {
+    if (event.eth_proto != ETH_P_ARP) { // ARP以外は廃棄
       // アプリ層に通知を出してパケット廃棄
       packet_events.perf_submit(ctx, &event, sizeof(event));
       return XDP_DROP;
@@ -393,7 +393,7 @@ def print_packet_event(cpu,data,size):
   global b
   event = b["packet_events"].event(data)
   printb(b"%-4d %-4d %-2d %-12lx %-16s %-5d %-12lx %-16s %-5d %-4d %-16s %-16s %-12lx %-12lx" % (
-    event.drop_reason,
+    event.check_result,
     event.eth_proto,
     event.protocol,
     event.eth_source,
