@@ -95,14 +95,14 @@ def mqtt_publish(mqtt_server_address, mqtt_server_port, mqtt_topic, turn):
     mqttSender.disconnect()
     print("MQTT送信完了")
     now = time.time()
-    print('performance: ' + str(now) + 'トータル' + str(messages) + ' 個のメッセージを送信')
+    print('performance: ' + str(now) + ' トータル ' + str(messages) + ' 個のメッセージを送信')
 
 def handle_exit(signum, frame):
     global messages, mqttSender
     mqttSender.loop_stop()
     mqttSender.disconnect()
     now = time.time()
-    print('performance: ' + str(now) + 'トータル' + str(messages) + ' 個のメッセージを送信')
+    print('performance: ' + str(now) + ' トータル ' + str(messages) + ' 個のメッセージを送信')
     print(f"シグナル {signum} を受信。後処理して終了します。")
     sys.exit(0)
 

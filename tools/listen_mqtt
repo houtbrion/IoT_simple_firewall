@@ -80,7 +80,7 @@ def handle_exit(signum, frame):
     mqttlistener.loop_stop()
     mqttlistener.disconnect()
     now = time.time()
-    print('performance: ' + str(now) + 'トータル' + str(messages) + ' 個のメッセージを受信')
+    print('performance: ' + str(now) + ' トータル ' + str(messages) + ' 個のメッセージを受信')
     print(f"シグナル {signum} を受信。後処理して終了します。")
     sys.exit(0)
 
@@ -93,5 +93,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     loadMqttConfig(args.filename)
     mqtt_listen(mqtt['server'], mqtt['port'], mqtt['topic'])
+    while True:
+        time.sleep(1)
 
 
