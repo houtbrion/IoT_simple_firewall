@@ -289,13 +289,15 @@ int packet_filter(struct xdp_md *ctx) {
   if (check_mac == 3) { // ユニキャストパケットで，発信元は認められた端末だが，宛先のMACがサーバ等ではない場合
     if (event.eth_proto != ETH_P_ARP) {  // ARP以外は廃棄
       // アプリ層に通知を出してパケット廃棄
-      packet_events.perf_submit(ctx, &event, sizeof(event));
-      return XDP_DROP;
+      goto packet_drop;
+      //packet_events.perf_submit(ctx, &event, sizeof(event));
+      //return XDP_DROP;
     }
   } else if (check_mac <1000) { // MACチェックの結果が否の場合
     // アプリ層に通知を出してパケット廃棄
-    packet_events.perf_submit(ctx, &event, sizeof(event));
-    return XDP_DROP;
+    goto packet_drop;
+    //packet_events.perf_submit(ctx, &event, sizeof(event));
+    //return XDP_DROP;
   }
 
   // MACレベルのプロトコルチェックが不要な場合はパケットは通す

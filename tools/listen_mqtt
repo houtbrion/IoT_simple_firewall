@@ -1,0 +1,97 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from paho.mqtt import client as mqtt_client
+import json
+import yaml
+import random
+import time
+import argparse
+import signal
+import sys
+
+# MQTTパラメータ
+MQTT_TIMEOUT = 5
+
+# 計量パラメータ
+interval = 10
+
+messages = 0
+messages = 0
+lastTime = 0
+lastMessages = 0
+
+# グローバルワーク変数
+mqtt_topic = ''
+
+def loadMqttConfig(input_file_name):
+    global mqtt, sequence
+    with open(input_file_name, 'r', encoding="utf-8") as yml:
+        config = yaml.safe_load(yml)
+    mqtt = config['mqtt']
+    sequence = config['sequence']
+
+def output_data(topic, data):
+    global interval, lastTime, messages, lastMessages
+    print( 'id : ' + str(data['id']) + ', type: ' + str(data['type']) + ', time: ' + str(data['time']) + ', command: ' + str(data['command']) + ', paramSize: ' + str(data['paramSize']) + ', param: ' + str(data['param']))
+    messages += 1
+    currentTime = time.time()
+    duration = currentTime - lastTime
+    if (duration > interval):
+        print('performance: '+str(currentTime) + " " +str((messages - lastMessages)/duration)+' 個/秒のメッセージを受信, トータル' + str(messages) + ' 個のメッセージを受信')
+        lastMessages = messages
+        lastTime = currentTime
+
+def connect_mqtt(server, port, topic):
+    global mqtt_topic
+    def on_disconnect(client, userdata, flags , result, properties):
+        if  result != 0:
+            print("mqtt connection ends.")
+    def on_message(client, userdata, msg):
+        global msgBuffMaxSize, msgBuff
+        message = msg.payload.decode()
+        json_data = json.loads(message)
+        output_data(msg.topic, json_data)
+    def on_connect(client, userdata, flags, rc, properties):
+        global mqtt_topic
+        if rc == 0:
+            mqttConnectionMsg = "MQTTブローカーへ接続成功"
+        else:
+            mqttConnectionMsg = "MQTTブローカーへ接続失敗, エラーコード = " + str(rc)
+        print(mqttConnectionMsg)
+        client.subscribe(mqtt_topic)
+        #client.subscribe(topic)
+    mqtt_topic = topic
+    client_id = f'listen-{random.randint(0, 1000)}'
+    client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2, client_id)
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    client.connect(server, port)
+    return client
+
+def mqtt_listen(mqtt_server_address, mqtt_server_port, mqtt_topic):
+    global interval, sequence, mqttlistener
+    mqttlistener = connect_mqtt(mqtt_server_address, mqtt_server_port, mqtt_topic)
+    mqttlistener.loop_start()
+
+def handle_exit(signum, frame):
+    global messages, mqttlistener
+    mqttlistener.loop_stop()
+    mqttlistener.disconnect()
+    now = time.time()
+    print('performance: ' + str(now) + 'トータル' + str(messages) + ' 個のメッセージを受信')
+    print(f"シグナル {signum} を受信。後処理して終了します。")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+    lastTime = time.time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("filename", help="MQTT設定ファイル名")
+    args = parser.parse_args()
+    loadMqttConfig(args.filename)
+    mqtt_listen(mqtt['server'], mqtt['port'], mqtt['topic'])
+
+

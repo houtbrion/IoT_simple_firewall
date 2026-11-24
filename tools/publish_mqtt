@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from paho.mqtt import client as mqtt_client
+import json
+import yaml
+import random
+import time
+import argparse
+import signal
+import sys
+
+# MQTTパラメータ
+MQTT_TIMEOUT = 5
+
+# 計量パラメータ
+interval = 10
+
+def loadMqttConfig(input_file_name):
+    global mqtt, sequence, scenario
+    with open(input_file_name, 'r', encoding="utf-8") as yml:
+        config = yaml.safe_load(yml)
+    mqtt = config['mqtt']
+    sequence = config['sequence']
+    scenario = config['scenario']
+
+def connect_mqtt(server, port):
+    def on_connect(client, userdata, flags, rc, properties):
+        if rc == 0:
+            mqttConnectionMsg = "MQTTブローカーへ接続成功"
+        else:
+            mqttConnectionMsg = "MQTTブローカーへ接続失敗, エラーコード = " + str(rc)
+        print(mqttConnectionMsg)
+    client_id = f'publish-{random.randint(0, 1000)}'
+    client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2, client_id)
+    client.on_connect = on_connect
+    client.connect(server, port )
+    return client
+
+def publish(topic, client, msg):
+    msg_count = 1
+    while True:
+        #time.sleep(1)
+        result = client.publish(topic, json.dumps(msg))
+        status = result[0]
+        if status == 0:
+            return "送信成功"
+        msg_count += 1
+        if msg_count > MQTT_TIMEOUT:
+            return "送信失敗"
+
+def mqtt_publish(mqtt_server_address, mqtt_server_port, mqtt_topic, turn):
+    global interval, sequence, mqttSender
+    mqttSender = connect_mqtt(mqtt_server_address, mqtt_server_port)
+    mqttSender.loop_start()
+    counter = 0
+    messages = 0
+    lastTime = time.time()
+    lastMessages = 0
+    loop_num = 1
+    while True:
+        for i in range(len(sequence)):
+            if 'wait' == sequence[i]['class']:
+                sec = int(sequence[i]['value'])
+                print('No.' + str(counter+1) + ' : ' + 'wait ' + str(sequence[i]['value']) + 'sec')
+                time.sleep(sec)
+            elif 'command' == sequence[i]['class']:
+                sendData = {}
+                sendData['id'] = sequence[i]['id']
+                sendData['type'] = sequence[i]['type']
+                sendData['time'] = sequence[i]['time']
+                sendData['command'] = sequence[i]['command']
+                sendData['paramSize'] = sequence[i]['paramSize']
+                if 0==int(sendData['time']):
+                    sendData['time'] = str(int(time.time()))
+                if 0!=sendData['paramSize']:
+                    sendData['param'] = sequence[i]['param']
+                commandStr = json.dumps(sendData)
+                print("Action No." + str(counter+1) + " : " + commandStr)
+                result = publish(mqtt_topic, mqttSender, sendData)
+                if result == "送信成功":
+                    messages += 1
+                currentTime = time.time()
+                duration = currentTime - lastTime
+                if duration > interval:
+                    print('performance: '+str(currentTime) + " " +str((messages - lastMessages)/duration)+' 個/秒のメッセージ送信に成功, トータル ' + str(messages) + ' 個のメッセージを送信')
+                    lastMessages = messages
+                    lastTime = currentTime
+                print(result)
+            counter+=1
+        loop_num += 1
+        if (loop_num > turn):
+            break
+    mqttSender.loop_stop()
+    mqttSender.disconnect()
+    print("MQTT送信完了")
+    now = time.time()
+    print('performance: ' + str(now) + 'トータル' + str(messages) + ' 個のメッセージを送信')
+
+def handle_exit(signum, frame):
+    global messages, mqttSender
+    mqttSender.loop_stop()
+    mqttSender.disconnect()
+    now = time.time()
+    print('performance: ' + str(now) + 'トータル' + str(messages) + ' 個のメッセージを送信')
+    print(f"シグナル {signum} を受信。後処理して終了します。")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("filename", help="MQTT設定ファイル名")
+    parser.add_argument("n", type=int, help="0なら無限繰り返し実行，1以上はその回数繰り返し．")
+    args = parser.parse_args()
+    loadMqttConfig(args.filename)
+    mqtt_publish(mqtt['server'], mqtt['port'], mqtt['topic'], args.n)
+
+
